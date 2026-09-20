@@ -15,7 +15,10 @@ from .config import Config
 from .io.exports import write_orientation_csv, write_vtu, write_vtu_tet
 from .io.inp_validator import validate_inp
 from .io.inp_writer import write_inp, write_inp_tet
+from .llm.advisor import Advisor
+from .llm.payload import build_state
 from .strategy.candidates import deterministic_candidates
+from .strategy.levers import apply_lever
 from .strategy.recipe import Recipe
 from .strategy.runner import run_isolated
 
@@ -66,18 +69,30 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
                         "massive" if pa.kind == "massive" else "sans peaux identifiées")
             return _tet_fallback(report, pa, r["analysis"], work, out_dir, cfg, stem, T0,
                                  reason="pièce massive" if pa.kind == "massive" else "peaux non identifiées")
-        winner, best = _sc8r_pass(pa, r["analysis"], work, cfg, report, T0, tag="A")
+        advisor = Advisor.from_config(cfg)
+        if advisor.enabled:
+            log.info("conseiller LLM actif (%s)", cfg["llm"]["base_url"])
+        has_microfix = bool(cfg["healing"].get("small_edge_tol_mm"))
+        winner, best, signal = _sc8r_pass(pa, r["analysis"], work, cfg, report, T0, tag="A",
+                                          advisor=advisor, allow_microfix=has_microfix)
         analysis_json = r["analysis"]
+        if signal == "tet" and cfg["tet"]["enabled"]:
+            report["sc8r_best"] = dict(recipe=best[0].label(), reasons=best[1].get("reasons", [])) if best else None
+            rep = _tet_fallback(report, pa, analysis_json, work, out_dir, cfg, stem, T0,
+                                reason="repli demandé par le conseiller LLM")
+            if rep["status"] == "OK_TET" or best is None:
+                return rep
 
         # ---------- passe B : micro-arêtes supprimées dans la CAD (import OCC), si A échoue ----------
-        if winner is None and cfg["healing"].get("small_edge_tol_mm"):
+        if winner is None and has_microfix:
             log.warning("aucune recette SC8R ne passe sur la géométrie brute -> passe B, micro-arêtes supprimées à l'import")
             cfg_b = cfg
             wb = work / "microfix"
             pa_b, r_b = _prepare(step, wb, cfg_b, reference_skin, report, T0, key="analysis_B")
             if pa_b is not None and str(pa_b.import_info.get("healing", "")).startswith("micro_edges") \
                     and pa_b.ref_faces and pa_b.opp_faces and pa_b.kind != "massive":
-                w_b, b_b = _sc8r_pass(pa_b, r_b["analysis"], wb, cfg_b, report, T0, tag="B")
+                w_b, b_b, _ = _sc8r_pass(pa_b, r_b["analysis"], wb, cfg_b, report, T0, tag="B",
+                                         advisor=advisor, allow_microfix=False)
                 if w_b is not None or (b_b is not None and (best is None or
                                         b_b[1]["metrics"]["score"] > best[1]["metrics"]["score"])):
                     pa, analysis_json, winner, best = pa_b, r_b["analysis"], w_b, b_b
@@ -160,10 +175,17 @@ def _neighbors(pa) -> dict[int, set[int]]:
     return nb
 
 
-def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str):
-    """Essais SC8R sur une géométrie analysée. Recette adaptative : après un essai à
-    plis structurés en échec, les plis voisins des éléments fautifs repassent en
-    maillage libre (transition pli structuré / face en biseau)."""
+def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str,
+               advisor: "Advisor | None" = None, allow_microfix: bool = False):
+    """Essais SC8R sur une géométrie analysée.
+
+    Après un échec, le prochain essai est choisi soit par le conseiller LLM (s'il est
+    actif et répond), soit par la montée gloutonne déterministe : un seul levier appliqué
+    à la meilleure recette obtenue jusque-là.
+
+    Renvoie (winner, best, signal) ; `signal` vaut "tet" ou "microfix" si le LLM demande de
+    changer de voie, sinon None.
+    """
     g = cfg["general"]
     T0 = time.time()                    # budget propre à chaque passe géométrique
     queue = list(deterministic_candidates(cfg))
@@ -174,6 +196,8 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str):
     history: list = []
     levers_done: set = set()
     adapt_left = [int(cfg["mesh"].get("adaptive_attempts", 4))]
+    signal = None
+    lc = cfg["llm"]
     k = 0
     while queue and k < g["max_attempts"] + int(cfg["mesh"].get("adaptive_attempts", 4)):
         rc = queue.pop(0)
@@ -220,6 +244,25 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str):
                     base_res["bad_faces"] = base_res["faces_not_meshed"]
                 if base_res.get("bad_faces") is not None:
                     bkey = id(base_rc)
+                    # 1) le conseiller LLM choisit le levier, si disponible
+                    if advisor is not None and advisor.enabled and \
+                            len(history) >= int(lc.get("min_attempts_before", 1)):
+                        state = build_state(pa, report["attempts"],
+                                            geometry="brute" if tag == "A" else "micro-arêtes supprimées",
+                                            max_attempts=int(lc["max_attempts_history"]),
+                                            max_faces=int(lc["max_faces"]))
+                        dec = advisor.propose(state, base_rc, base_res, bend_faces, tried_alg,
+                                              allow_microfix=allow_microfix)
+                        report.setdefault("llm", []).append(dict(essai=len(report["attempts"]), **dec.log_entry()))
+                        if dec.action in ("tet", "microfix"):
+                            signal = dec.action
+                            log.warning("LLM : %s (%s)", dec.action, dec.reason[:120])
+                            break
+                        if dec.recipe is not None:
+                            levers_done.add((bkey, dec.action))
+                            adapt_left[0] -= 1
+                            queue.insert(0, dec.recipe)
+                            continue
                     for lever in ("alg", "free", "merge"):
                         if (bkey, lever) in levers_done:
                             continue
@@ -253,7 +296,7 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str):
                         adapt_left[0] -= 1
                         queue.insert(0, Recipe(**d).clamp())
                         break
-    return winner, best
+    return winner, best, signal
 
 
 def _tet_fallback(report, pa, analysis_json, work, out_dir, cfg, stem, T0, reason: str) -> dict:

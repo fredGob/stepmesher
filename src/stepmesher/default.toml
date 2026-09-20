@@ -87,3 +87,18 @@ min_angle_deg = 20.0            # CIBLE
 max_angle_deg = 160.0           # CIBLE
 max_warp_deg = 20.0             # CIBLE
 soft_violation_pct = 0.2        # % max d'éléments hors cibles
+
+[llm]
+# Conseiller LLM local (llama-server), optionnel et jamais bloquant : il choisit le
+# prochain essai quand une recette échoue. Toute panne (serveur absent, délai, JSON
+# invalide, action inconnue) fait repartir sur les règles déterministes.
+#   llama-server -m qwen3-4b-instruct-q4_k_m.gguf -c 8192 -ngl 99 -fa --port 8080
+enabled = false
+base_url = "http://127.0.0.1:8080"
+model = "local"                 # nom transmis à l'API (ignoré par llama-server)
+timeout_s = 60.0
+temperature = 0.2
+max_tokens = 256                # sortie : une décision JSON, ~50-150 tokens
+max_attempts_history = 10       # essais transmis (les plus récents) ; borne la taille du prompt
+max_faces = 12                  # faces fautives listées par essai
+min_attempts_before = 1         # nb d'essais échoués avant de solliciter le LLM

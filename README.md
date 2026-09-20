@@ -8,9 +8,9 @@ modèle « deux peaux » (pièces massives, nervures, jonctions en T) basculent 
 **repli tétraédrique C3D10** (C3D4 en option).
 
 > **État** : les 5 pièces réelles de `stps_test/` sortent avec un maillage valide
-> (voir § 8). Tôle constante : `OK`. Épaisseur variable : `OK_APPROX`. Repli tétra : `OK_TET`.
+> (voir § 9). Tôle constante : `OK`. Épaisseur variable : `OK_APPROX`. Repli tétra : `OK_TET`.
 > Pas encore faits : mémoire de recettes SQLite, LLM optionnel, zones d'épaisseur alignées
-> sur le maillage (voir § 9).
+> sur le maillage (voir § 10).
 
 ---
 
@@ -60,6 +60,7 @@ Options utiles de `mesh` :
 | `--strategies conform,subdiv` | ordre des stratégies de maillage quad |
 | `--tet-order 1\|2` | repli tétra en C3D4 ou C3D10 (défaut 2) |
 | `--no-tet` | pas de repli tétra (échec SC8R = `FAILED_QUALITY`) |
+| `--llm` / `--llm-url URL` | conseiller LLM local (§ 7) |
 | `--threads N` | threads gmsh |
 | `--keep-work` | conserve les essais intermédiaires (`out/.work/`) |
 
@@ -204,7 +205,38 @@ Tétra : `*ELEMENT, TYPE=C3D10` (ou C3D4), `NS_SKIN`, `ES_ALL`, `ES_QUALITY_WARN
 **Aucun bloc matériau** : définir `*MATERIAL, NAME=TBD` (ou renommer) avant calcul.
 Fichiers en ASCII pur (pas d'accents) pour Abaqus.
 
-## 7. Configuration
+## 7. Conseiller LLM local (optionnel)
+
+Quand une recette échoue, le prochain essai est choisi soit par les règles déterministes
+(§ 4.3), soit par un **LLM local** servi par llama-server. Désactivé par défaut.
+
+```bash
+llama-server -m qwen3-4b-instruct-q4_k_m.gguf -c 8192 -ngl 99 -fa --port 8080
+stepmesher mesh piece.stp -o out/ --llm            # ou --llm-url http://127.0.0.1:8080
+```
+
+- **Entrée** : résumé de la pièce (nature, paliers, nombre de faces, plis, trous) et
+  historique des essais (recette, raison de l'échec, faces fautives). Taille bornée par
+  `llm.max_attempts_history` et `llm.max_faces` : mesurée entre 150 et 3 300 tokens sur les
+  pièces d'essai, soit **`-c 8192` largement suffisant**.
+- **Sortie** : un JSON contraint par schéma, une action parmi `alg`, `free`, `merge`,
+  `size`, `subdiv`, `microfix`, `tet`, plus une phrase de justification.
+- **Le LLM ne construit jamais la recette** : il choisit un levier, et le code applique ce
+  levier (`strategy/levers.py`), filtre les faces inventées et borne les valeurs. Une action
+  inconnue, un serveur absent, un délai dépassé ou un JSON illisible font simplement
+  repartir sur les règles déterministes — le maillage n'échoue jamais à cause du LLM.
+- **Traçabilité** : chaque décision (action, recette obtenue, raison, durée, tokens estimés,
+  réponse brute) est écrite dans le `.json` sous la clé `llm`.
+
+| Clé `[llm]` | Défaut | Rôle |
+|---|---|---|
+| `enabled` | false | activer le conseiller |
+| `base_url` | http://127.0.0.1:8080 | adresse de llama-server |
+| `timeout_s` / `max_tokens` | 60 / 256 | délai d'une décision, longueur de la réponse |
+| `max_attempts_history` / `max_faces` | 10 / 12 | bornes de la charge utile |
+| `min_attempts_before` | 1 | essais échoués avant de solliciter le LLM |
+
+## 8. Configuration
 
 `stepmesher dump-config` affiche tous les paramètres commentés. Les principaux :
 
@@ -222,7 +254,7 @@ Fichiers en ASCII pur (pas d'accents) pour Abaqus.
 | `tet.order` | 2 | 2 = C3D10, 1 = C3D4 |
 | `general.attempt_timeout_s` / `part_time_budget_s` | 600 / 2400 | délais |
 
-## 8. Tests et résultats
+## 9. Tests et résultats
 
 ```bash
 pytest -m "not real"     # pièces synthétiques
@@ -236,7 +268,8 @@ conservés, arêtes vives, choix de la peau de référence, paliers d'épaisseur
 orthonormalité des repères, invariance du hash par déplacement rigide, confinement des
 plantages et délais, garde-fou de performance.
 
-État : **80 tests verts** (73 synthétiques en ~4 min, 7 sur pièces réelles en ~20 min).
+État : **92 tests verts** (85 synthétiques en ~4 min, dont 12 sur le conseiller LLM avec un
+faux llama-server, et 7 sur pièces réelles en ~20 min).
 
 ### Pièces réelles `stps_test/` (conteneur 2 cœurs / 7 Go)
 
@@ -254,7 +287,7 @@ passent en géométrie brute (passe A).
 (arête < 10 % de la taille mini) ; écart de volume maillage / CAD 0,5 %. Les 24 essais SC8R
 (passes A et B) échouent sur des éléments retournés à la jonction en T avant le repli.
 
-## 9. Limites connues
+## 10. Limites connues
 
 - **Épaisseur variable** : maillage approché (`OK_APPROX`). Chaque nœud est décalé jusqu'à la
   peau opposée locale, mais les marches d'épaisseur ne sont pas alignées sur le maillage : les

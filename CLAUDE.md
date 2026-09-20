@@ -16,7 +16,7 @@ stepmesher mesh stps_test/ -o out/                  # lot ; summary.csv + par pi
 stepmesher inspect piece.stp                        # analyse seule
 stepmesher validate out/piece.inp                   # validateur interne
 stepmesher dump-config                              # config par défaut (src/stepmesher/default.toml)
-pytest -m "not real"                               # 73 tests synthétiques, ~4-5 min
+pytest -m "not real"                               # 85 tests synthétiques, ~4-5 min
 pytest -m real                                     # 7 tests sur stps_test/, ~20 min
 ```
 
@@ -57,6 +57,13 @@ Pipeline d'une pièce (`process.py::process_part`) :
    micro-arêtes (`Geometry.OCCFixSmallEdges`).
 4. `_tet_fallback` : sources (brep préparé, STEP micro-fix 0,01 / 0,005, STEP brut) ×
    `TET_ALGOS`, chaque combinaison isolée (gmsh segfaulte parfois).
+4bis. **Conseiller LLM** (`llm/`, optionnel, `[llm] enabled`) : à chaque échec, `Advisor`
+   envoie l'état (`llm/payload.build_state`, borné) à llama-server avec un schéma JSON
+   (`llm/schema`), reçoit UNE action, et le code applique le levier via
+   `strategy/levers.apply_lever`. Faces inventées filtrées, valeurs bornées, toute panne
+   -> règles déterministes. Actions `tet` / `microfix` remontent en signal à `process_part`.
+   Décisions journalisées dans le `.json` (clé `llm`). Testé avec un faux serveur HTTP
+   (`tests/test_llm.py`), aucun modèle requis.
 5. Export `io/inp_writer` (+ `write_inp_tet`), `io/exports` (.vtu, CSV), validation
    `io/inp_validator`, rapport JSON.
 
@@ -118,6 +125,7 @@ pendant un lot fait planter les sous-processus** (ils relisent le fichier).
    pied de poche — Fred préfère aujourd'hui la transition lissée.
 8. **Composite** (plus tard, sur demande) : correspondance paliers ↔ drapages,
    `*SHELL SECTION, COMPOSITE`, direction 0°, face moule.
-9. **LLM local optionnel** (llama.cpp / llama-server, JSON contraint, jamais bloquant) pour
-   proposer des leviers de recette à partir des raisons d'échec.
+9. **LLM local** : fait (voir 4bis). Reste à mesurer sur la campagne de Fred (400 pièces,
+   GPU 8 Go, Qwen3-4B Q4_K_M conseillé, `-c 8192`) : nombre d'essais moyen avec et sans LLM,
+   qualité des actions proposées, et éventuellement quelques exemples dans le prompt.
 10. Surfaces de chants (`SURF_EDGES`) et sets par bord libre si utiles au chargement.

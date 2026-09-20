@@ -41,6 +41,12 @@ def _overrides(a) -> dict:
         ov.setdefault("general", {})["threads"] = a.threads
     if getattr(a, "tet_order", None):
         ov.setdefault("tet", {})["order"] = a.tet_order
+    if getattr(a, "llm", False):
+        ov.setdefault("llm", {})["enabled"] = True
+    if getattr(a, "no_llm", False):
+        ov.setdefault("llm", {})["enabled"] = False
+    if getattr(a, "llm_url", None):
+        ov.setdefault("llm", {}).update(enabled=True, base_url=a.llm_url)
     if getattr(a, "no_tet", False):
         ov.setdefault("tet", {})["enabled"] = False
     return ov
@@ -141,6 +147,9 @@ def main(argv=None):
     sm.add_argument("--tet-order", type=int, choices=[1, 2],
                     help="repli tétra : 2 = C3D10 (défaut), 1 = C3D4")
     sm.add_argument("--no-tet", action="store_true", help="désactiver le repli tétraédrique")
+    sm.add_argument("--llm", action="store_true", help="activer le conseiller LLM local (llama-server)")
+    sm.add_argument("--no-llm", action="store_true", help="désactiver le conseiller LLM")
+    sm.add_argument("--llm-url", metavar="URL", help="adresse de llama-server (implique --llm)")
     sm.set_defaults(fn=cmd_mesh)
 
     si = sub.add_parser("inspect", help="analyse seule : peaux, épaisseurs, plis, trous, temps")
