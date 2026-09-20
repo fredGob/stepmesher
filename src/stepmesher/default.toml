@@ -1,0 +1,89 @@
+# Configuration par défaut de stepmesher.
+# Copier ce fichier (`stepmesher dump-config > ma_config.toml`), modifier, puis
+# passer `--config ma_config.toml`. Seules les clés présentes surchargent les défauts.
+# Toutes les longueurs sont en mm.
+
+[general]
+occ_target_unit = "MM"          # conversion d'unités à l'import STEP
+attempt_timeout_s = 600         # délai max d'un essai de maillage (sous-processus)
+part_time_budget_s = 2400       # budget de temps total par pièce
+max_attempts = 8                # nombre max d'essais de maillage par pièce
+threads = 2                     # threads gmsh
+
+[healing]
+enabled = true
+aggressive = false              # true : suppression des micro-arêtes / micro-faces
+tolerance = 1e-6
+volume_rel_tol = 1e-4           # au-delà, le nettoyage est rejeté (géométrie brute conservée)
+small_edge_tol_mm = [0.02, 0.01]  # suppression des micro-arêtes à l'import (tolérances essayées)
+max_volume_change = 1e-3        # variation de volume admise pour la suppression des micro-arêtes
+
+[analysis]
+sample_size_frac = 0.01         # taille de la triangulation d'analyse (fraction de diagonale)
+sample_curvature = 12           # éléments par 2*pi pour la triangulation d'analyse
+max_thickness_mm = 15.0         # épaisseur max recherchée lors de l'appariement des peaux
+opposite_normal_tol_deg = 25.0  # tolérance d'antiparallélisme de deux peaux
+patch_angle_deg = 30.0          # angle dièdre max à l'intérieur d'un patch lisse
+skin_ratio = 0.6                # patch = peau si épaisseur < skin_ratio * largeur du patch
+constant_thickness_rel_tol = 0.08  # dispersion d'épaisseur tolérée pour une tôle constante
+sharp_edge_angle_deg = 20.0     # au-delà, arête vive entre deux faces de peau
+bend_min_angle_deg = 10.0       # angle mini pour compter une face comme pli
+
+[holes]
+fill = true                     # bouchage automatique des petits trous
+max_diameter_mm = 12.0          # seuil absolu (0 = ignoré)
+max_diameter_frac = 0.02        # seuil relatif à la diagonale (0 = ignoré)
+                                # seuil effectif = min des seuils non nuls
+
+[mesh]
+size_frac = 0.01                # taille cible = size_frac * diagonale OBB ...
+thickness_factor = 10.0         # ... plafonnée à thickness_factor * épaisseur ...
+min_size_mm = 0.5               # ... et bornée à [min_size_mm, max_size_mm]
+max_size_mm = 50.0
+micro_edge_ratio = 0.2          # arête < ratio x min_size_mm : imposée par une micro-arête CAD
+                                # (nœud glissé le long du bord ; exemptée des seuils de forme)
+n_per_bend = 4                  # éléments min sur l'arc d'un pli
+structured_patches = false      # true : TOUTES les faces à 4 côtés régulières en transfini
+                                # (false : seulement les petites, côté <= 3 x taille)
+curvature_n = 24                # éléments par tour complet sur les surfaces courbes (0 = off)
+n_per_hole = 12                 # éléments min sur le périmètre d'un trou conservé
+tangent_angle_deg = 10.0        # fusion en surfaces composites sous cet angle
+reference_skin = "inner"        # inner | outer
+size_variants = [1.0, 0.7]      # multiplicateurs de taille essayés pour chaque stratégie
+local_repair = true             # bascule d'arête + lissage local des quads médiocres
+repair_threshold = 0.2          # quads visés : jacobien 2D sous ce seuil
+adaptive_attempts = 8           # essais adaptatifs (remaillage local des faces fautives)
+strategies = ["conform", "subdiv"]
+                                # disponibles aussi : "compound" (fusion des faces tangentes :
+                                # plante ou dépasse le délai sur les pièces CATIA testées),
+                                # "blossom" (peut laisser des triangles,
+                                # utile avec allow_wedge_pct > 0), "qqs" (quasi-structuré, lent)
+
+[tet]
+# Repli tétraédrique : pièce massive, ou toutes les recettes SC8R en échec.
+enabled = true
+order = 2                       # 2 = C3D10 (défaut), 1 = C3D4
+size_frac = 0.01                # taille = size_frac * diagonale ...
+thickness_factor = 1.0          # ... plafonnée à k * épaisseur médiane (~2 C3D10 dans l'épaisseur)
+min_size_mm = 0.5
+max_size_mm = 20.0
+curvature_n = 8                 # raffinement sur les surfaces courbes (éléments par tour)
+min_size_ratio = 0.25           # taille min = ratio x taille cible
+min_shape_quality = 0.05        # rayon inscrit normalisé (1 = tétra régulier)
+
+[quality]
+# Deux niveaux :
+# - critères DURS, vérifiés sur 100 % des éléments (sinon la recette échoue) ;
+# - critères CIBLES : au plus soft_violation_pct % d'éléments hors cible. Ces éléments
+#   sont regroupés dans l'ELSET ES_QUALITY_WARN et listés dans le rapport.
+#   soft_violation_pct = 0 -> tous les critères deviennent stricts.
+hard_min_scaled_jacobian = 0.1  # DUR : jacobien normalisé min (hexa, 8 coins) ; <= 0 = retourné
+max_reprojection_error = 0.05   # DUR : fraction de l'épaisseur locale
+max_thickness_deviation = 0.15  # DUR (tôle constante) : épaisseur d'élément vs épaisseur locale
+allow_wedge_pct = 0.0           # DUR : % de triangles tolérés (convertis en SC6R)
+min_scaled_jacobian = 0.2       # CIBLE
+max_aspect_ratio = 10.0         # CIBLE : quad dans le plan (arête max / arête min)
+min_angle_deg = 20.0            # CIBLE
+max_angle_deg = 160.0           # CIBLE
+max_warp_deg = 20.0             # CIBLE
+soft_violation_pct = 0.2        # % max d'éléments hors cibles
