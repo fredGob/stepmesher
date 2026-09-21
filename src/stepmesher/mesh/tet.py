@@ -139,10 +139,10 @@ TET_ALGOS = ((6, 1, 1.0), (1, 1, 1.0), (6, 10, 1.0))
 
 def tet_sources(pa) -> list[tuple[str, str, float | None]]:
     """Géométrie préparée (trous bouchés, micro-arêtes supprimées), puis STEP d'origine
-    avec correction de micro-arêtes plus douce, puis STEP brut : la correction à
-    0,02 mm peut rendre le maillage de surface auto-intersectant."""
+    avec correction de micro-arêtes plus douce, puis STEP brut : une tolérance trop
+    agressive peut rendre le maillage de surface auto-intersectant."""
     return [("préparée", pa.brep, None)] + \
-           [(f"STEP, micro-arêtes {t} mm", pa.source, t) for t in (0.01, 0.005)] + \
+           [(f"STEP, micro-arêtes {t} mm", pa.source, t) for t in (0.1, 0.05, 0.02, 0.01, 0.005)] + \
            [("STEP brut", pa.source, None)]
 
 

@@ -103,9 +103,10 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
         m, soft = quality.evaluate(sm, off, cfg, pa.kind)
         res["metrics"] = m
         hf_all = np.r_[sm.hexa_face, sm.wedge_face]
-        bad_el = soft | (np.r_[quality.scaled_jacobian(sm.nodes, sm.hexa, quality.HEX_CORNERS),
-                               quality.scaled_jacobian(sm.nodes, sm.wedge, quality.WEDGE_CORNERS)]
-                         < cfg["quality"]["hard_min_scaled_jacobian"])
+        sj_h = quality.scaled_jacobian(sm.nodes, sm.hexa, quality.HEX_CORNERS)
+        sj_w = quality.scaled_jacobian(sm.nodes, sm.wedge, quality.WEDGE_CORNERS)
+        bad_el = soft | (np.r_[sj_h, sj_w] < cfg["quality"]["hard_min_scaled_jacobian"])
+        bad_el[:len(sm.hexa)] |= quality.hex_internal_jacobian(sm.nodes, sm.hexa) <= 0
         bad_el[len(sm.hexa):] = True          # triangles restants
         res["bad_faces"] = sorted({int(f) for f in hf_all[bad_el]})
         bad_nodes = set(np.unique(np.r_[sm.hexa[bad_el[:len(sm.hexa)], :4].ravel(),
@@ -125,8 +126,7 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
         res["passed"] = m["passed"]
         res["reasons"] = m["reasons"]
         res["status"] = "passed" if m["passed"] else "failed"
-        sj = np.r_[quality.scaled_jacobian(sm.nodes, sm.hexa, quality.HEX_CORNERS),
-                   quality.scaled_jacobian(sm.nodes, sm.wedge, quality.WEDGE_CORNERS)]
+        sj = np.r_[sj_h, sj_w]
         np.savez_compressed(
             out.with_suffix(".npz"), nodes=sm.nodes, n_ref=sm.n_ref, hexa=sm.hexa, wedge=sm.wedge,
             hexa_face=sm.hexa_face, wedge_face=sm.wedge_face, normal=sm.normal, stack=sm.stack,

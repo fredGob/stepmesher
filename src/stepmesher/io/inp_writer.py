@@ -30,6 +30,13 @@ def to_ascii(text: str) -> str:
     return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
 
+def part_name(source) -> str:
+    """Nom de *PART Abaqus dérivé du fichier source (ascii, pas d'espace, <=80 car.)."""
+    stem = to_ascii(Path(source).stem).upper()
+    stem = "".join(c if (c.isalnum() or c == "_") else "_" for c in stem)
+    return stem[:80] or "PART"
+
+
 def assign_zones(thickness: np.ndarray, zones: list[float]) -> tuple[np.ndarray, list[float]]:
     """Zone d'épaisseur de chaque élément (palier le plus proche, en échelle log)."""
     if not zones:
@@ -87,6 +94,7 @@ def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: s
         f.write(f"** éléments : {nh} SC8R, {nw} SC6R ; 1 élément dans l'épaisseur\n")
         f.write("** nœuds 1-4 (1-3) sur la peau de référence, 5-8 (4-6) sur la peau opposée\n")
         f.write("** MATERIAL=TBD : bloc matériau à fournir\n")
+        f.write(f"*PART, NAME={part_name(pa.source)}\n")
         f.write("*NODE, NSET=NALL\n")
         for i, p in enumerate(nodes, 1):
             f.write(f"{i}, {p[0]:.9g}, {p[1]:.9g}, {p[2]:.9g}\n")
@@ -175,6 +183,7 @@ def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: s
             f.write(f"*SHELL SECTION, ELSET={zone_names[z]}, MATERIAL=TBD, ORIENTATION=ORI_ELEM, "
                     f"STACK DIRECTION=3\n")
             f.write(f"{zone_t[z]:.6g}, 5\n")
+        f.write("*END PART\n")
     Path(path).write_text(to_ascii(f.getvalue()), encoding="ascii")
     names = [zone_names.get(z, "") for z in range(max(used) + 1)] if used else []
     return dict(zones={zone_names[z]: zone_t[z] for z in used}, elsets=elsets, nsets=nsets,
@@ -195,6 +204,7 @@ def write_inp_tet(path: Path, mesh: dict, pa, metrics: dict, status: str) -> dic
     f.write(f"** repli tetraedrique : {len(C)} {etype}, taille {metrics.get('size', 0):.4g} mm\n")
     f.write(f"** nature detectee : {pa.kind}\n")
     f.write("** MATERIAL=TBD : bloc materiau a fournir\n")
+    f.write(f"*PART, NAME={part_name(pa.source)}\n")
     f.write("*NODE, NSET=NALL\n")
     for i, p in enumerate(X, 1):
         f.write(f"{i}, {p[0]:.9g}, {p[1]:.9g}, {p[2]:.9g}\n")
@@ -213,5 +223,6 @@ def write_inp_tet(path: Path, mesh: dict, pa, metrics: dict, status: str) -> dic
         f.write("*ELSET, ELSET=ES_QUALITY_WARN\n")
         _ids(f, np.nonzero(q < 0.1)[0] + 1)
     f.write("*SOLID SECTION, ELSET=ES_ALL, MATERIAL=TBD\n")
+    f.write("*END PART\n")
     Path(path).write_text(to_ascii(f.getvalue()), encoding="ascii")
     return dict(element_type=etype)

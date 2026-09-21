@@ -5,8 +5,8 @@
 
 [general]
 occ_target_unit = "MM"          # conversion d'unités à l'import STEP
-attempt_timeout_s = 600         # délai max d'un essai de maillage (sous-processus)
-part_time_budget_s = 2400       # budget de temps total par pièce
+attempt_timeout_s = 300         # délai max d'un essai de maillage (sous-processus)
+part_time_budget_s = 900        # budget de temps total par pièce
 max_attempts = 8                # nombre max d'essais de maillage par pièce
 threads = 2                     # threads gmsh
 
@@ -15,8 +15,15 @@ enabled = true
 aggressive = false              # true : suppression des micro-arêtes / micro-faces
 tolerance = 1e-6
 volume_rel_tol = 1e-4           # au-delà, le nettoyage est rejeté (géométrie brute conservée)
-small_edge_tol_mm = [0.02, 0.01]  # suppression des micro-arêtes à l'import (tolérances essayées)
+small_edge_tol_mm = [0.2, 0.1, 0.05, 0.02, 0.01]  # micro-arêtes supprimées à l'import (essayées
+                                # de la plus grande à la plus petite ; au-delà de ~0.2-0.3 mm,
+                                # OCC casse des faces sur des pièces CATIA réelles)
 max_volume_change = 1e-3        # variation de volume admise pour la suppression des micro-arêtes
+
+occ_wireframe = true            # nettoyage OCP systématique (ShapeFix_Wireframe) avant maillage :
+                                # effondre les micro-arêtes en préservant le solide (kernel OCP requis)
+occ_wireframe_precision_mm = 0.05      # arêtes plus courtes effondrées (aligné sur quality.min_absolute_edge_mm)
+occ_wireframe_max_volume_change = 5e-3  # au-delà, le nettoyage OCP est rejeté (géométrie brute conservée)
 
 [analysis]
 sample_size_frac = 0.01         # taille de la triangulation d'analyse (fraction de diagonale)
@@ -81,6 +88,8 @@ hard_min_scaled_jacobian = 0.1  # DUR : jacobien normalisé min (hexa, 8 coins) 
 max_reprojection_error = 0.05   # DUR : fraction de l'épaisseur locale
 max_thickness_deviation = 0.15  # DUR (tôle constante) : épaisseur d'élément vs épaisseur locale
 allow_wedge_pct = 0.0           # DUR : % de triangles tolérés (convertis en SC6R)
+min_absolute_edge_mm = 0.05     # DUR : plus petite arête tolérée (mm), jamais exemptée, même pour
+                                # une arête « imposée par la CAD » (0 = désactivé)
 min_scaled_jacobian = 0.2       # CIBLE
 max_aspect_ratio = 10.0         # CIBLE : quad dans le plan (arête max / arête min)
 min_angle_deg = 20.0            # CIBLE

@@ -57,6 +57,8 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
     log.addHandler(fh)
     try:
         log.info("=== %s ===", step.name)
+        # ---------- nettoyage géométrique OCP (systématique) : micro-arêtes effondrées ----------
+        step = _clean_step_occ(step, work, cfg, report)
         # ---------- passe A : géométrie brute (micro-arêtes traitées au niveau du maillage) ----------
         cfg_a = Config(cfg.to_dict())
         cfg_a.data["healing"]["small_edge_tol_mm"] = []
@@ -73,15 +75,9 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
         if advisor.enabled:
             log.info("conseiller LLM actif (%s)", cfg["llm"]["base_url"])
         has_microfix = bool(cfg["healing"].get("small_edge_tol_mm"))
-        winner, best, signal = _sc8r_pass(pa, r["analysis"], work, cfg, report, T0, tag="A",
-                                          advisor=advisor, allow_microfix=has_microfix)
+        winner, best = _sc8r_pass(pa, r["analysis"], work, cfg, report, T0, tag="A",
+                                  advisor=advisor, allow_microfix=has_microfix)
         analysis_json = r["analysis"]
-        if signal == "tet" and cfg["tet"]["enabled"]:
-            report["sc8r_best"] = dict(recipe=best[0].label(), reasons=best[1].get("reasons", [])) if best else None
-            rep = _tet_fallback(report, pa, analysis_json, work, out_dir, cfg, stem, T0,
-                                reason="repli demandé par le conseiller LLM")
-            if rep["status"] == "OK_TET" or best is None:
-                return rep
 
         # ---------- passe B : micro-arêtes supprimées dans la CAD (import OCC), si A échoue ----------
         if winner is None and has_microfix:
@@ -91,8 +87,8 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
             pa_b, r_b = _prepare(step, wb, cfg_b, reference_skin, report, T0, key="analysis_B")
             if pa_b is not None and str(pa_b.import_info.get("healing", "")).startswith("micro_edges") \
                     and pa_b.ref_faces and pa_b.opp_faces and pa_b.kind != "massive":
-                w_b, b_b, _ = _sc8r_pass(pa_b, r_b["analysis"], wb, cfg_b, report, T0, tag="B",
-                                         advisor=advisor, allow_microfix=False)
+                w_b, b_b = _sc8r_pass(pa_b, r_b["analysis"], wb, cfg_b, report, T0, tag="B",
+                                       advisor=advisor, allow_microfix=False)
                 if w_b is not None or (b_b is not None and (best is None or
                                         b_b[1]["metrics"]["score"] > best[1]["metrics"]["score"])):
                     pa, analysis_json, winner, best = pa_b, r_b["analysis"], w_b, b_b
@@ -144,14 +140,31 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
             shutil.rmtree(work, ignore_errors=True)
 
 
+def _clean_step_occ(step: Path, work: Path, cfg: Config, report: dict) -> Path:
+    """Nettoyage géométrique OCP (ShapeFix_Wireframe) : effondre les micro-arêtes en
+    préservant le solide. Renvoie le STEP nettoyé si accepté, sinon la géométrie brute."""
+    h = cfg["healing"]
+    if not h.get("occ_wireframe", False):
+        return step
+    from .occ.clean import clean_step
+    res = clean_step(step, work / "cleaned.step",
+                     precision=h["occ_wireframe_precision_mm"],
+                     max_volume_change=h["occ_wireframe_max_volume_change"])
+    report["occ_clean"] = dict(status=res.status, messages=res.messages, stats=res.stats)
+    for m in res.messages:
+        log.info("nettoyage OCP : %s", m)
+    return Path(res.path)
+
+
 def _prepare(step, work, cfg, reference_skin, report, T0, key):
     """Analyse en sous-processus isolé. Retourne (PartAnalysis, résultat) ou (None, résultat)."""
     work.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    left = cfg["general"]["part_time_budget_s"] - (t0 - T0)
     r = run_isolated("stepmesher.strategy.jobs:prepare_job",
                      dict(step=str(step), workdir=str(work), cfg_data=cfg.to_dict(),
                           reference_skin=reference_skin, out_json=str(work / "prepare.json")),
-                     work / "prepare.json", timeout=cfg["general"]["part_time_budget_s"])
+                     work / "prepare.json", timeout=max(0.0, left))
     report["timings"][key] = time.time() - t0
     if r.get("status") != "ok":
         report.update(status="ANALYSIS_FAILED", reasons=r.get("reasons", []))
@@ -183,11 +196,11 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str,
     actif et répond), soit par la montée gloutonne déterministe : un seul levier appliqué
     à la meilleure recette obtenue jusque-là.
 
-    Renvoie (winner, best, signal) ; `signal` vaut "tet" ou "microfix" si le LLM demande de
-    changer de voie, sinon None.
+    Renvoie `(winner, best)`. Les propositions LLM `microfix` et `tet` sont tracées, mais
+    ne peuvent pas écourter les essais SC8R : seul le pipeline détermine le repli.
     """
     g = cfg["general"]
-    T0 = time.time()                    # budget propre à chaque passe géométrique
+    # T0 = début de la pièce (partagé entre toutes les phases : budget TOTAL par pièce)
     queue = list(deterministic_candidates(cfg))
     seen = set()
     winner, best = None, None
@@ -196,7 +209,6 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str,
     history: list = []
     levers_done: set = set()
     adapt_left = [int(cfg["mesh"].get("adaptive_attempts", 4))]
-    signal = None
     lc = cfg["llm"]
     k = 0
     while queue and k < g["max_attempts"] + int(cfg["mesh"].get("adaptive_attempts", 4)):
@@ -219,7 +231,8 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str,
         entry = dict(index=len(report["attempts"]), geometry=tag, recipe=rc.to_dict(), label=rc.label(),
                      status=res.get("status"), exec=res.get("exec_status"), reasons=res.get("reasons", []),
                      seconds=res.get("timings", {}).get("total"), n_elements=m.get("n_elements"),
-                     sj_min=(m.get("scaled_jacobian") or {}).get("min"))
+                     sj_min=(m.get("scaled_jacobian") or {}).get("min"),
+                     internal_jacobian_min=(m.get("internal_jacobian") or {}).get("min"))
         report["attempts"].append(entry)
         log.info("essai %s%d %-22s -> %s %s", tag, k, rc.label(), entry["status"],
                  "; ".join(entry["reasons"][:3]) if entry["reasons"] else "")
@@ -255,9 +268,10 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str,
                                               allow_microfix=allow_microfix)
                         report.setdefault("llm", []).append(dict(essai=len(report["attempts"]), **dec.log_entry()))
                         if dec.action in ("tet", "microfix"):
-                            signal = dec.action
-                            log.warning("LLM : %s (%s)", dec.action, dec.reason[:120])
-                            break
+                            # Ces voies sont validées par le pipeline, après les essais SC8R.
+                            # Une suggestion LLM ne doit pas écarter une tôle maillable.
+                            log.warning("LLM : %s demandé (%s), poursuite des essais SC8R",
+                                        dec.action, dec.reason[:120])
                         if dec.recipe is not None:
                             levers_done.add((bkey, dec.action))
                             adapt_left[0] -= 1
@@ -296,19 +310,19 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str,
                         adapt_left[0] -= 1
                         queue.insert(0, Recipe(**d).clamp())
                         break
-    return winner, best, signal
+    return winner, best
 
 
 def _tet_fallback(report, pa, analysis_json, work, out_dir, cfg, stem, T0, reason: str) -> dict:
     """Essais tétraédriques, chacun en sous-processus isolé (gmsh peut planter) :
     sources géométriques x combinaisons d'algorithmes, arrêt au premier qui passe."""
     from .mesh.tet import TET_ALGOS, tet_sources
-    t0 = time.time()                    # budget propre au repli tétraédrique (T0 = début de pièce)
+    t0 = time.time()                    # sert seulement à mesurer la durée de cette phase
     res, best = {}, None
     n_src = len(tet_sources(pa))
     for si in range(n_src):
         for ai in range(len(TET_ALGOS)):
-            left = cfg["general"]["part_time_budget_s"] - (time.time() - t0)
+            left = cfg["general"]["part_time_budget_s"] - (time.time() - T0)
             if left < 30:
                 break
             prefix = work / f"tet_{si}{ai}"

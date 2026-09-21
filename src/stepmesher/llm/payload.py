@@ -57,6 +57,8 @@ def build_state(pa, attempts: list, geometry: str, max_attempts: int = 10,
                 e["faces_fautives_total"] = len(bad)
         if a.get("sj_min") is not None:
             e["jacobien_min"] = round(float(a["sj_min"]), 3)
+        if a.get("internal_jacobian_min") is not None:
+            e["jacobien_interne_min"] = round(float(a["internal_jacobian_min"]), 6)
         st["essais"].append(e)
     if len(attempts) > max_attempts:
         st["essais_omis"] = len(attempts) - max_attempts

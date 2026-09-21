@@ -10,6 +10,8 @@ from .offset import OffsetResult
 HEX_CORNERS = [(0, 1, 3, 4), (1, 2, 0, 5), (2, 3, 1, 6), (3, 0, 2, 7),
                (4, 7, 5, 0), (5, 4, 6, 1), (6, 5, 7, 2), (7, 6, 4, 3)]
 WEDGE_CORNERS = [(0, 1, 2, 3), (1, 2, 0, 4), (2, 0, 1, 5), (3, 5, 4, 0), (4, 3, 5, 1), (5, 4, 3, 2)]
+HEX_SIGNS = np.array([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+                      [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], float)
 
 
 def scaled_jacobian(X: np.ndarray, conn: np.ndarray, corners) -> np.ndarray:
@@ -24,6 +26,31 @@ def scaled_jacobian(X: np.ndarray, conn: np.ndarray, corners) -> np.ndarray:
         det = np.einsum("ij,ij->i", e1, np.cross(e2, e3))
         nrm = np.linalg.norm(e1, axis=1) * np.linalg.norm(e2, axis=1) * np.linalg.norm(e3, axis=1)
         out = np.minimum(out, det / np.maximum(nrm, 1e-300))
+    return out
+
+
+def hex_internal_jacobian(X: np.ndarray, conn: np.ndarray) -> np.ndarray:
+    """Déterminant minimal du mapping trilineaire dans chaque hexaèdre.
+
+    Les jacobiens aux huit coins ne détectent pas forcément une inversion interne
+    d'un SC8R gauchi. La grille $3x3x3$ couvre aussi le centre d'intégration.
+    """
+    if len(conn) == 0:
+        return np.zeros(0)
+    points = (-np.sqrt(3 / 5), 0.0, np.sqrt(3 / 5))
+    P = X[conn]
+    out = np.full(len(conn), np.inf)
+    for xi in points:
+        for eta in points:
+            for zeta in points:
+                s = HEX_SIGNS
+                dxi = 0.125 * s[:, 0] * (1 + s[:, 1] * eta) * (1 + s[:, 2] * zeta)
+                deta = 0.125 * (1 + s[:, 0] * xi) * s[:, 1] * (1 + s[:, 2] * zeta)
+                dzeta = 0.125 * (1 + s[:, 0] * xi) * (1 + s[:, 1] * eta) * s[:, 2]
+                J = np.stack((np.einsum("i,nij->nj", dxi, P),
+                              np.einsum("i,nij->nj", deta, P),
+                              np.einsum("i,nij->nj", dzeta, P)), axis=1)
+                out = np.minimum(out, np.linalg.det(J))
     return out
 
 
@@ -70,6 +97,7 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
     sj_h = scaled_jacobian(X, sm.hexa, HEX_CORNERS)
     sj_w = scaled_jacobian(X, sm.wedge, WEDGE_CORNERS)
     sj = np.r_[sj_h, sj_w]
+    det_h = hex_internal_jacobian(X, sm.hexa)
     Qb = sm.hexa[:, :4]
     aspect, amin, amax, warp = quad_metrics(X, Qb)
     n_el = len(sm.hexa) + len(sm.wedge)
@@ -85,7 +113,8 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
 
     m = dict(
         n_nodes=int(len(X)), n_elements=int(n_el), n_sc8r=int(len(sm.hexa)), n_sc6r=int(len(sm.wedge)),
-        triangle_pct=tri_pct, scaled_jacobian=_stats(sj), n_negative_jacobian=int(np.sum(sj <= 0)),
+        triangle_pct=tri_pct, scaled_jacobian=_stats(sj), internal_jacobian=_stats(det_h),
+        n_negative_jacobian=int(np.sum((sj_h <= 0) | (det_h <= 0)) + np.sum(sj_w <= 0)),
         aspect_ratio=_stats(aspect), min_angle=_stats(amin), max_angle=_stats(amax), warp_deg=_stats(warp),
         reprojection_error=_stats(off.reproj_err), thickness_deviation=_stats(t_dev),
         offset_tilt=_stats(getattr(off, "tilt", np.zeros(0))),
@@ -96,20 +125,33 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
     # quad de base avec une arête < 10 % de la taille min de maille : imposé par une
     # micro-géométrie CAD (exempté des seuils de forme, jamais du critère « non retourné »)
     Pq = X[Qb]
-    emin = np.min(np.linalg.norm(np.roll(Pq, -1, axis=1) - Pq, axis=2), axis=1) if len(Qb) else np.zeros(0)
-    imposed = np.r_[emin < cfg["mesh"]["micro_edge_ratio"] * cfg["mesh"]["min_size_mm"], np.zeros(n_el - len(Qb), bool)]
+    emin_h = np.min(np.linalg.norm(np.roll(Pq, -1, axis=1) - Pq, axis=2), axis=1) if len(Qb) else np.zeros(0)
+    Pw = X[sm.wedge[:, :3]] if len(sm.wedge) else np.zeros((0, 3, 3))
+    emin_w = np.min(np.linalg.norm(np.roll(Pw, -1, axis=1) - Pw, axis=2), axis=1) if len(Pw) else np.zeros(0)
+    emin = np.r_[emin_h, emin_w]
+    imposed = emin < cfg["mesh"]["micro_edge_ratio"] * cfg["mesh"]["min_size_mm"]
     m["geometry_imposed"] = dict(count=int((imposed & (sj < q["min_scaled_jacobian"])).sum()),
                                  edge_threshold_mm=cfg["mesh"]["micro_edge_ratio"] * cfg["mesh"]["min_size_mm"])
+    m["min_edge"] = _stats(emin)
     reasons = []
     # --- critères durs (100 % des éléments) ---
     if n_el == 0:
         reasons.append("aucun élément")
     if m["n_negative_jacobian"]:
         reasons.append(f"{m['n_negative_jacobian']} élément(s) retourné(s) (jacobien <= 0)")
-    hard_bad = (sj < q["hard_min_scaled_jacobian"]) & ~imposed
-    if hard_bad.any():
-        reasons.append(f"jacobien normalisé min {sj[hard_bad].min():.3f} < {q['hard_min_scaled_jacobian']} "
-                       f"(critère dur, {int(hard_bad.sum())} élément(s))")
+    # plancher absolu de taille : jamais exempté, même pour une arête « imposée par la CAD »
+    # (sinon un défaut STEP non nettoyé produit des éléments dégénérés qui passent quand même)
+    min_edge_mm = q.get("min_absolute_edge_mm", 0.0)
+    too_small = emin < min_edge_mm if min_edge_mm > 0 else np.zeros(n_el, bool)
+    if too_small.any():
+        reasons.append(f"{int(too_small.sum())} élément(s) avec arête < {min_edge_mm} mm "
+                       f"(critère dur, plancher absolu, min observé {emin[too_small].min():.4g} mm)")
+    internal_bad = det_h <= 0
+    hard_bad = ((sj < q["hard_min_scaled_jacobian"]) & ~imposed) | too_small
+    hard_bad[:len(det_h)] |= internal_bad
+    if (hard_bad & ~too_small).any():
+        reasons.append(f"jacobien normalisé min {sj[hard_bad & ~too_small].min():.3f} < {q['hard_min_scaled_jacobian']} "
+                       f"(critère dur, {int((hard_bad & ~too_small).sum())} élément(s))")
     if tri_pct > q["allow_wedge_pct"] + 1e-12:
         reasons.append(f"{tri_pct:.2f} % de triangles > {q['allow_wedge_pct']} % toléré")
     if off.reproj_err.max(initial=0) > q["max_reprojection_error"]:

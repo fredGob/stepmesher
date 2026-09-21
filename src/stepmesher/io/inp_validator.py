@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..mesh.quality import HEX_CORNERS, WEDGE_CORNERS, scaled_jacobian
+from ..mesh.quality import HEX_CORNERS, WEDGE_CORNERS, hex_internal_jacobian, scaled_jacobian
 
 NNODES = {"SC8R": 8, "SC6R": 6, "C3D8": 8, "C3D6": 6, "C3D4": 4, "C3D10": 10}
 
@@ -194,8 +194,13 @@ def validate_inp(path: Path) -> dict:
         if len(conn):
             sj = scaled_jacobian(X, conn, corners)
             stats[f"{et}_min_scaled_jacobian"] = float(sj.min())
-            if (sj <= 0).any():
-                errors.append(f"{int((sj <= 0).sum())} élément(s) {et} de volume négatif ou nul")
+            bad = sj <= 0
+            if et == "SC8R":
+                det = hex_internal_jacobian(X, conn)
+                stats["SC8R_min_internal_jacobian"] = float(det.min())
+                bad |= det <= 0
+            if bad.any():
+                errors.append(f"{int(bad.sum())} élément(s) {et} de volume négatif ou nul")
     for et in ("C3D10", "C3D4"):
         conn = np.array([[pos[c] for c in cn[:4]] for (t, cn) in elems.values() if t == et
                          and all(c in pos for c in cn)], dtype=np.int64).reshape(-1, 4)
