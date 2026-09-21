@@ -196,8 +196,11 @@ SC8R :
   signalent que la distinction intérieure/extérieure est peu significative), et les mêmes peaux sous
   les noms `SURF_REF` (faces S1, nœuds 1-4) / `SURF_OPP` (faces S2, nœuds 5-8). Le JSON
   indique quelle face (S1/S2) porte chaque surface et les aires ;
-- orientation par élément : `*DISTRIBUTION` (axes 1 et 2) + `*ORIENTATION` ;
-- une `*SHELL SECTION` par zone : `MATERIAL=TBD`, `ORIENTATION=ORI_ELEM`, `STACK DIRECTION=3`.
+- une seule `*SHELL SECTION` sur `ES_ALL` : `MATERIAL=TBD`, `STACK DIRECTION=3`,
+  épaisseur constante = moyenne des épaisseurs d'éléments du maillage. L'orientation par
+  élément (blocs `*DISTRIBUTION` / `*ORIENTATION`) est retirée pour l'instant — invalide
+  telle quelle dans `*PART` ; les axes 1/2 par élément restent disponibles dans
+  `_orientation.csv` pour la réintroduire plus tard.
 
 Tétra : `*ELEMENT, TYPE=C3D10` (ou C3D4), `NS_SKIN`, `ES_ALL`, `ES_QUALITY_WARN`,
 `*SOLID SECTION, MATERIAL=TBD`.
@@ -305,8 +308,9 @@ passent en géométrie brute (passe A).
 - **Stratégie `compound`** (surfaces composites globales) : disponible mais retirée des défauts
   (plantages et délais sur les pièces CATIA testées) ; la fusion locale reste un levier adaptatif.
 - **À confirmer au premier datacheck Abaqus** :
-  1. syntaxe de l'orientation par `*DISTRIBUTION` ;
-  2. pour les continuum shells, l'épaisseur mécanique vient de la géométrie nodale ; la valeur
-     écrite dans `*SHELL SECTION` est l'épaisseur nominale de la zone ;
-  3. `STACK DIRECTION=3` avec la numérotation 1-4 / 5-8 produite ;
-  4. C3D10 : ordre des nœuds milieux (vérifié par géométrie, à confirmer par Abaqus).
+  1. pour les continuum shells, l'épaisseur mécanique vient de la géométrie nodale ; la valeur
+     écrite dans `*SHELL SECTION` est une épaisseur nominale constante (moyenne du maillage) ;
+  2. `STACK DIRECTION=3` avec la numérotation 1-4 / 5-8 produite ;
+  3. C3D10 : ordre des nœuds milieux (vérifié par géométrie, à confirmer par Abaqus).
+  - Orientation par élément (`*DISTRIBUTION` / `*ORIENTATION`) retirée pour l'instant :
+    invalide telle quelle dans `*PART`, à réintroduire plus tard depuis `_orientation.csv`.

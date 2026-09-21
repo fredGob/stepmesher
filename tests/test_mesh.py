@@ -20,7 +20,9 @@ def test_variable_part_is_flagged_approximate(meshed):
     r = reps["plaque_poches"]
     assert r["status"] == "OK_APPROX"
     assert r["approximate"] is True
-    assert len(r["sections"]) == 2                      # une section par palier (2 et 6 mm)
+    # section unique à épaisseur constante (moyenne du maillage) ; paliers 2 et 6 mm
+    assert list(r["sections"]) == ["ES_ALL"]
+    assert 2.0 <= r["sections"]["ES_ALL"] <= 6.0
 
 
 def test_massive_part_falls_back_to_c3d10(meshed):

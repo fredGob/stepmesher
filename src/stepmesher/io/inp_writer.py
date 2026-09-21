@@ -1,10 +1,14 @@
-"""Export Abaqus .inp : SC8R (+ SC6R), sets, surfaces, orientation par élément, sections.
+"""Export Abaqus .inp : SC8R (+ SC6R), sets, surfaces, section unique.
 
-Aucun bloc matériau : les sections référencent MATERIAL=TBD, à définir par l'utilisateur.
+Aucun bloc matériau : la section référence MATERIAL=TBD, à définir par l'utilisateur.
 
 Note continuum shell : l'épaisseur mécanique d'un SC8R est portée par la géométrie
-nodale ; la valeur écrite dans *SHELL SECTION est l'épaisseur nominale mesurée de la
-zone (à confirmer lors du datacheck Abaqus, cf. README).
+nodale ; la valeur écrite dans *SHELL SECTION est une épaisseur nominale constante
+(moyenne des épaisseurs d'éléments du maillage), à confirmer lors du datacheck Abaqus.
+
+Orientation par élément retirée pour l'instant : les blocs *DISTRIBUTION / *ORIENTATION
+ne passaient pas tels quels dans *PART. L'orientation reste disponible dans le CSV
+`_orientation.csv` si besoin de la réintroduire plus tard.
 """
 from __future__ import annotations
 
@@ -165,28 +169,17 @@ def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: s
                 f.write(f"ES_SC6R, {face}\n")
             surfaces[name] = face
 
-        # --- orientation par élément ---
-        a1, a2 = mesh["axis1"], mesh["axis2"]
-        f.write("*DISTRIBUTION TABLE, NAME=ORI_TABLE\n")
-        f.write("COORD3D, COORD3D\n")
-        f.write("*DISTRIBUTION, NAME=ORI_DIST, LOCATION=ELEMENT, TABLE=ORI_TABLE\n")
-        f.write(", 1., 0., 0., 0., 1., 0.\n")
-        for k in range(n_el):
-            u, v = a1[k], a2[k]
-            f.write(f"{k + 1}, {u[0]:.7g}, {u[1]:.7g}, {u[2]:.7g}, {v[0]:.7g}, {v[1]:.7g}, {v[2]:.7g}\n")
-        f.write("*ORIENTATION, NAME=ORI_ELEM, DEFINITION=COORDINATES, SYSTEM=RECTANGULAR\n")
-        f.write("ORI_DIST\n")
-        f.write("3, 0.\n")
-
-        # --- sections : une par zone d'épaisseur ---
-        for z in used:
-            f.write(f"*SHELL SECTION, ELSET={zone_names[z]}, MATERIAL=TBD, ORIENTATION=ORI_ELEM, "
-                    f"STACK DIRECTION=3\n")
-            f.write(f"{zone_t[z]:.6g}, 5\n")
+        # --- section unique : épaisseur constante (moyenne des éléments) ---
+        # Orientation par élément retirée (blocs *DISTRIBUTION / *ORIENTATION invalides
+        # dans *PART) ; réintroduire depuis le CSV _orientation.csv si besoin plus tard.
+        t_section = float(np.mean(thick)) if len(thick) else 0.0
+        f.write(f"** épaisseur de section constante ~{t_section:.4g} mm (moyenne du maillage)\n")
+        f.write("*SHELL SECTION, ELSET=ES_ALL, MATERIAL=TBD, STACK DIRECTION=3\n")
+        f.write(f"{t_section:.6g}, 5\n")
         f.write("*END PART\n")
     Path(path).write_text(to_ascii(f.getvalue()), encoding="ascii")
     names = [zone_names.get(z, "") for z in range(max(used) + 1)] if used else []
-    return dict(zones={zone_names[z]: zone_t[z] for z in used}, elsets=elsets, nsets=nsets,
+    return dict(zones={"ES_ALL": t_section}, elsets=elsets, nsets=nsets,
                 zone_of=zone_of, zone_names=names, surfaces=surfaces,
                 skin_areas=dict(S1=a_ref, S2=a_opp, rel_diff=rel,
                                 inner_outer_significant=bool(rel >= 0.005)))

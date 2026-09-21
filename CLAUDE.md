@@ -119,10 +119,14 @@ pendant un lot fait planter les sous-processus** (ils relisent le fichier).
 
 ## Points à confirmer au premier datacheck Abaqus
 
-1. syntaxe `*DISTRIBUTION` / `*ORIENTATION` par élément ;
-2. épaisseur de `*SHELL SECTION` (nominale par zone) vs épaisseur nodale des SC8R ;
-3. `STACK DIRECTION=3` avec numérotation 1-4 / 5-8 ;
-4. faces S1/S2 des surfaces ; ordre des nœuds milieux C3D10.
+1. épaisseur de `*SHELL SECTION` (section unique, épaisseur constante = moyenne du maillage)
+   vs épaisseur nodale des SC8R ;
+2. `STACK DIRECTION=3` avec numérotation 1-4 / 5-8 ;
+3. faces S1/S2 des surfaces ; ordre des nœuds milieux C3D10.
+
+Orientation par élément (`*DISTRIBUTION` / `*ORIENTATION`) **retirée** du writer pour l'instant
+(invalide telle quelle dans `*PART`, demande de Fred) ; les axes 1/2 par élément restent
+écrits dans `_orientation.csv` pour la réintroduire plus tard.
 
 ## Pistes futures (par priorité proposée)
 
