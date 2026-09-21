@@ -95,7 +95,10 @@ max_aspect_ratio = 10.0         # CIBLE : quad dans le plan (arête max / arête
 min_angle_deg = 20.0            # CIBLE
 max_angle_deg = 160.0           # CIBLE
 max_warp_deg = 20.0             # CIBLE
-soft_violation_pct = 0.2        # % max d'éléments hors cibles
+soft_violation_pct = 0.2        # % max d'éléments hors cibles (tôle constante)
+soft_violation_pct_variable = 1.0  # idem pour les pièces à épaisseur VARIABLE (rampes) : la
+                                # transition d'épaisseur lissée produit quelques éléments en biais
+                                # inévitables ; tolérance plus large (critères DURS jamais relâchés)
 
 [llm]
 # Conseiller LLM local (llama-server), optionnel et jamais bloquant : il choisit le

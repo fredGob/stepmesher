@@ -36,7 +36,10 @@ Les 5 pièces de `stps_test/` passent :
 | part_349 | OK_APPROX | ~66 700 SC8R | 3 paliers, 36 faces remaillées, ~5 min |
 
 Décisions validées avec Fred :
-- tolérance « soft » **0,2 %** d'éléments hors cibles (critères durs jamais relâchés) ;
+- tolérance « soft » **0,2 %** d'éléments hors cibles pour les tôles **constantes** ;
+  **1,0 %** pour les pièces à épaisseur **variable** (rampes : quelques hexa en biais
+  inévitables à la transition lissée) — `[quality] soft_violation_pct{,_variable}` ;
+  critères durs jamais relâchés ;
 - priorité = **nettoyer le STEP** (surfaces utiles, micro-arêtes, plaque ou non) puis mailler ;
 - épaisseur variable (pièces composites) : **transition lissée acceptée** (OK_APPROX), pas
   besoin de marches alignées ; **ne pas traiter le composite** (drapages, 0°, face moule) pour

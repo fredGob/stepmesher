@@ -173,10 +173,15 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
     soft_all = soft | (imposed & (sj < q["min_scaled_jacobian"]))
     n_soft = int(soft.sum())
     pct = 100.0 * n_soft / max(n_el, 1)
-    m["soft_violations"] = dict(count=n_soft, pct=pct, by_criterion=detail,
+    # tôle constante : tolérance stricte ; épaisseur variable (rampes) : tolérance plus
+    # large (la transition lissée impose quelques éléments en biais). Critères durs inchangés.
+    soft_limit = q["soft_violation_pct"]
+    if kind == "variable":
+        soft_limit = q.get("soft_violation_pct_variable", soft_limit)
+    m["soft_violations"] = dict(count=n_soft, pct=pct, limit_pct=soft_limit, by_criterion=detail,
                                 elements=(np.nonzero(soft)[0] + 1).tolist()[:500])
-    if pct > q["soft_violation_pct"] + 1e-12:
-        reasons.append(f"{n_soft} élément(s) hors cibles ({pct:.2f} % > {q['soft_violation_pct']} %) : {detail}")
+    if pct > soft_limit + 1e-12:
+        reasons.append(f"{n_soft} élément(s) hors cibles ({pct:.2f} % > {soft_limit} %) : {detail}")
     m["passed"] = not reasons
     m["reasons"] = reasons
     # score pour départager des essais tous en échec (le moins mauvais)

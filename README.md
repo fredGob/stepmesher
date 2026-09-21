@@ -175,8 +175,10 @@ combinaison est isolée (gmsh peut planter sur une surface auto-intersectante).
   normalisé ≥ `hard_min_scaled_jacobian` (0,1), 100 % quads (sauf `allow_wedge_pct`), erreur de
   reprojection ≤ 5 % de l'épaisseur, et pour une tôle constante écart d'épaisseur ≤ 15 %.
 - **Critères cibles** : jacobien ≥ 0,2, élancement ≤ 10, angles entre 20° et 160°,
-  gauchissement ≤ 20°. Au plus `soft_violation_pct` (**0,2 %**) des éléments peuvent être hors
-  cible ; ils sont regroupés dans `ES_QUALITY_WARN` et listés dans le JSON.
+  gauchissement ≤ 20°. Au plus `soft_violation_pct` des éléments peuvent être hors
+  cible : **0,2 %** pour une tôle constante, **1,0 %** (`soft_violation_pct_variable`) pour une
+  pièce à épaisseur variable (les rampes imposent quelques hexa en biais à la transition lissée).
+  Ils sont regroupés dans `ES_QUALITY_WARN` et listés dans le JSON.
   `soft_violation_pct = 0` rend tous les critères stricts.
 
 Pourquoi deux niveaux : sur des pièces CATIA réelles, quelques quads à angle presque plat se
@@ -253,7 +255,7 @@ stepmesher mesh piece.stp -o out/ --llm            # ou --llm-url http://127.0.0
 | `mesh.adaptive_attempts` | 8 | essais adaptatifs supplémentaires par passe |
 | `holes.max_diameter_mm` / `max_diameter_frac` | 12 / 0,02 | seuil de bouchage = min des deux |
 | `healing.small_edge_tol_mm` | [0.02, 0.01] | tolérances de la passe B |
-| `quality.soft_violation_pct` | 0,2 | % d'éléments tolérés hors cible |
+| `quality.soft_violation_pct` / `_variable` | 0,2 / 1,0 | % d'éléments tolérés hors cible (constante / variable) |
 | `tet.order` | 2 | 2 = C3D10, 1 = C3D4 |
 | `general.attempt_timeout_s` / `part_time_budget_s` | 600 / 2400 | délais |
 
