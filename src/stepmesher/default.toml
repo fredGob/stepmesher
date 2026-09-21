@@ -60,6 +60,10 @@ size_variants = [1.0, 0.7]      # multiplicateurs de taille essayés pour chaque
 local_repair = true             # bascule d'arête + lissage local des quads médiocres
 repair_threshold = 0.2          # quads visés : jacobien 2D sous ce seuil
 adaptive_attempts = 8           # essais adaptatifs (remaillage local des faces fautives)
+skip_sc8r_below = 0.0           # si > 0 : score de faisabilité SC8R (analyze/feasibility) sous
+                                # ce seuil -> repli tétra direct sans épuiser les essais SC8R.
+                                # 0 = jamais (avis de faisabilité seulement journalisé/summary).
+                                # A calibrer sur une campagne avant d'activer (0.35-0.45 typique).
 strategies = ["conform", "subdiv"]
                                 # disponibles aussi : "compound" (fusion des faces tangentes :
                                 # plante ou dépasse le délai sur les pièces CATIA testées),

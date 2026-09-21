@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .analyze.feasibility import assess_feasibility
 from .analyze.pipeline import PartAnalysis
 from .config import Config
 from .io.exports import write_orientation_csv, write_vtu, write_vtu_tet
@@ -24,9 +25,10 @@ from .strategy.runner import run_isolated
 
 log = logging.getLogger("stepmesher")
 
-SUMMARY_FIELDS = ["part", "status", "memory", "kind", "t_median_mm", "n_zones", "reference_skin", "recipe",
-                  "element_type", "n_elements", "sj_min", "sj_p05", "soft_violation_pct", "reprojection_max",
-                  "thickness_dev_max", "n_attempts", "time_s", "output", "message"]
+SUMMARY_FIELDS = ["part", "status", "memory", "kind", "feasibility", "feasibility_score", "t_median_mm",
+                  "n_zones", "reference_skin", "recipe", "element_type", "n_elements", "sj_min", "sj_p05",
+                  "soft_violation_pct", "reprojection_max", "thickness_dev_max", "n_attempts", "time_s",
+                  "output", "message"]
 
 
 def _json_default(o):
@@ -37,6 +39,57 @@ def _json_default(o):
     if isinstance(o, float) and not np.isfinite(o):
         return None
     raise TypeError(type(o))
+
+
+def _sc8r_passes(step, work, cfg, reference_skin, report, T0, advisor, has_microfix, vtag, vlabel):
+    """Passes SC8R (A : micro-arêtes au maillage ; B : micro-arêtes supprimées à l'import)
+    sur UNE géométrie. Retourne un dict (pa, analysis_json, winner, best, geometry_pass,
+    no_skin) ou None si l'analyse échoue. Ne fait ni tétra ni export."""
+    cfg_a = Config(cfg.to_dict())
+    cfg_a.data["healing"]["small_edge_tol_mm"] = []
+    pa, r = _prepare(step, work, cfg_a, reference_skin, report, T0, key=f"analysis_{vtag or 'A'}")
+    if pa is None:
+        return None
+    out = dict(pa=pa, analysis_json=r["analysis"], winner=None, best=None,
+               geometry_pass=f"A ({vlabel})", label=vlabel, no_skin=False)
+    if not pa.ref_faces or not pa.opp_faces or pa.kind == "massive":
+        out["no_skin"] = True
+        return out
+    winner, best = _sc8r_pass(pa, r["analysis"], work, cfg, report, T0, tag=f"{vtag}A",
+                              advisor=advisor, allow_microfix=has_microfix)
+    if winner is None and has_microfix:
+        log.warning("aucune recette SC8R sur la géométrie %s -> passe B (micro-arêtes supprimées à l'import)", vlabel)
+        wb = work / "microfix"
+        pa_b, r_b = _prepare(step, wb, cfg, reference_skin, report, T0, key=f"analysis_B_{vtag or 'A'}")
+        if pa_b is not None and str(pa_b.import_info.get("healing", "")).startswith("micro_edges") \
+                and pa_b.ref_faces and pa_b.opp_faces and pa_b.kind != "massive":
+            w_b, b_b = _sc8r_pass(pa_b, r_b["analysis"], wb, cfg, report, T0, tag=f"{vtag}B",
+                                   advisor=advisor, allow_microfix=False)
+            if w_b is not None or (b_b is not None and (best is None or
+                                    b_b[1]["metrics"]["score"] > best[1]["metrics"]["score"])):
+                out["pa"], out["analysis_json"] = pa_b, r_b["analysis"]
+                out["geometry_pass"] = f"B ({vlabel}, micro-arêtes supprimées)"
+                winner, best = w_b, b_b
+    out["winner"], out["best"] = winner, best
+    return out
+
+
+def _variant_is_perfect(v) -> bool:
+    """Variante SC8R gagnante sans aucun élément hors cibles : inutile d'en essayer une autre."""
+    w = v.get("winner")
+    if w is None:
+        return False
+    return int((w[1]["metrics"].get("soft_violations") or {}).get("count", 0)) == 0
+
+
+def _variant_rank(v):
+    """Clé de tri des variantes : une gagnante prime, puis meilleur score, puis moins d'éléments hors cibles."""
+    w = v.get("winner")
+    if w is not None:
+        m = w[1]["metrics"]
+        return (2, m.get("score", 0.0), -int((m.get("soft_violations") or {}).get("count", 0)))
+    b = v.get("best")
+    return (1 if b is not None else 0, b[1]["metrics"].get("score", -1e18) if b else -1e18, 0)
 
 
 def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | None = None,
@@ -58,44 +111,58 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
     try:
         log.info("=== %s ===", step.name)
         # ---------- nettoyage géométrique OCP (systématique) : micro-arêtes effondrées ----------
-        step = _clean_step_occ(step, work, cfg, report)
-        # ---------- passe A : géométrie brute (micro-arêtes traitées au niveau du maillage) ----------
-        cfg_a = Config(cfg.to_dict())
-        cfg_a.data["healing"]["small_edge_tol_mm"] = []
-        pa, r = _prepare(step, work, cfg_a, reference_skin, report, T0, key="analysis")
-        if pa is None:
-            return _finish(report, out_dir, T0)
-        report["analysis"] = _analysis_summary(pa)
-        if not pa.ref_faces or not pa.opp_faces or pa.kind == "massive":
-            log.warning("pièce %s : pas de maillage SC8R possible -> repli tétraédrique",
-                        "massive" if pa.kind == "massive" else "sans peaux identifiées")
-            return _tet_fallback(report, pa, r["analysis"], work, out_dir, cfg, stem, T0,
-                                 reason="pièce massive" if pa.kind == "massive" else "peaux non identifiées")
+        raw_step = step
+        step_c = _clean_step_occ(step, work, cfg, report)
+        cleaned = str(step_c) != str(raw_step)   # OCP a réellement modifié la géométrie
         advisor = Advisor.from_config(cfg)
         if advisor.enabled:
             log.info("conseiller LLM actif (%s)", cfg["llm"]["base_url"])
         has_microfix = bool(cfg["healing"].get("small_edge_tol_mm"))
-        winner, best = _sc8r_pass(pa, r["analysis"], work, cfg, report, T0, tag="A",
-                                  advisor=advisor, allow_microfix=has_microfix)
-        analysis_json = r["analysis"]
 
-        # ---------- passe B : micro-arêtes supprimées dans la CAD (import OCC), si A échoue ----------
-        if winner is None and has_microfix:
-            log.warning("aucune recette SC8R ne passe sur la géométrie brute -> passe B, micro-arêtes supprimées à l'import")
-            cfg_b = cfg
-            wb = work / "microfix"
-            pa_b, r_b = _prepare(step, wb, cfg_b, reference_skin, report, T0, key="analysis_B")
-            if pa_b is not None and str(pa_b.import_info.get("healing", "")).startswith("micro_edges") \
-                    and pa_b.ref_faces and pa_b.opp_faces and pa_b.kind != "massive":
-                w_b, b_b = _sc8r_pass(pa_b, r_b["analysis"], wb, cfg_b, report, T0, tag="B",
-                                       advisor=advisor, allow_microfix=False)
-                if w_b is not None or (b_b is not None and (best is None or
-                                        b_b[1]["metrics"]["score"] > best[1]["metrics"]["score"])):
-                    pa, analysis_json, winner, best = pa_b, r_b["analysis"], w_b, b_b
-                    report["analysis"] = _analysis_summary(pa)
-                    report["geometry_pass"] = "B (micro-arêtes supprimées)"
-        report.setdefault("geometry_pass", "A (brute)")
-        report["timings"]["meshing"] = time.time() - T0 - report["timings"]["analysis"]
+        # ---------- SC8R sur la géométrie nettoyée (ou brute si OCP n'a rien changé) ----------
+        v_clean = _sc8r_passes(step_c, work, cfg, reference_skin, report, T0, advisor, has_microfix,
+                               vtag="", vlabel="nettoyée" if cleaned else "brute")
+        if v_clean is None:
+            return _finish(report, out_dir, T0)
+        pa = v_clean["pa"]
+        report["analysis"] = _analysis_summary(pa)
+        # ---------- avis de faisabilité SC8R (triage ; déviation optionnelle) ----------
+        feas = assess_feasibility(pa)
+        report["feasibility"] = feas
+        log.info("faisabilité SC8R : %s (score %.2f) - %s", feas["verdict"], feas["score"], feas["reason"])
+        if v_clean["no_skin"]:
+            log.warning("pièce %s : pas de maillage SC8R possible -> repli tétraédrique",
+                        "massive" if pa.kind == "massive" else "sans peaux identifiées")
+            return _tet_fallback(report, pa, v_clean["analysis_json"], work, out_dir, cfg, stem, T0,
+                                 reason="pièce massive" if pa.kind == "massive" else "peaux non identifiées")
+        skip_below = cfg["mesh"].get("skip_sc8r_below", 0.0)
+        if skip_below > 0 and feas["score"] < skip_below and cfg["tet"]["enabled"]:
+            log.warning("faisabilité SC8R faible (score %.2f < %.2f) -> repli tétra direct",
+                        feas["score"], skip_below)
+            return _tet_fallback(report, pa, v_clean["analysis_json"], work, out_dir, cfg, stem, T0,
+                                 reason=f"faisabilité SC8R faible ({feas['score']:.2f} < {skip_below})")
+
+        # ---------- SC8R sur la géométrie brute (pré-OCP) : OCP peut sur-nettoyer et écraser
+        # des éléments ; on garde le meilleur des deux. Seulement si OCP a nettoyé et que la
+        # variante nettoyée n'est pas déjà parfaite. ----------
+        variants = [v_clean]
+        if cleaned and not _variant_is_perfect(v_clean):
+            log.info("OCP a nettoyé la géométrie -> essai SC8R aussi sur la géométrie brute (pré-OCP), meilleur retenu")
+            v_raw = _sc8r_passes(raw_step, work / "raw", cfg, reference_skin, report, T0, advisor,
+                                 has_microfix, vtag="R", vlabel="brute (pré-OCP)")
+            if v_raw is not None and not v_raw["no_skin"]:
+                variants.append(v_raw)
+
+        chosen_v = max(variants, key=_variant_rank)
+        pa = chosen_v["pa"]
+        analysis_json = chosen_v["analysis_json"]
+        winner, best = chosen_v["winner"], chosen_v["best"]
+        report["analysis"] = _analysis_summary(pa)
+        report["geometry_pass"] = chosen_v["geometry_pass"]
+        if len(variants) > 1:
+            report["geometry_variants"] = [dict(label=v["label"], geometry_pass=v["geometry_pass"],
+                                                won=v["winner"] is not None) for v in variants]
+        report["timings"]["meshing"] = time.time() - T0 - report["timings"].get("analysis_A", 0.0)
 
         if winner is None and cfg["tet"]["enabled"]:
             log.warning("aucune recette SC8R ne passe les critères -> repli tétraédrique")
@@ -397,7 +464,9 @@ def summary_row(rep: dict) -> dict:
     m = rep.get("metrics") or {}
     a = rep.get("analysis") or {}
     c = a.get("classification") or {}
+    feas = rep.get("feasibility") or {}
     return dict(part=rep["part"], status=rep.get("status"), memory=rep["memory"]["status"], kind=a.get("kind"),
+                feasibility=feas.get("verdict"), feasibility_score=feas.get("score"),
                 t_median_mm=c.get("t_median"), n_zones=len(a.get("thickness_zones") or []),
                 reference_skin=a.get("reference_reason"), recipe=rep.get("recipe_label"),
                 element_type=m.get("element_type") or ("SC8R" if m else None),

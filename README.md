@@ -101,6 +101,17 @@ Statuts : `OK` (SC8R, tôle constante), `OK_APPROX` (SC8R, épaisseur variable, 
    Supprimer systématiquement les micro-arêtes à l'import casse certaines faces BSpline
    (face non maillable, surfaces auto-intersectantes pour le tétra) : c'est pourquoi la
    géométrie brute est essayée d'abord.
+   - *nettoyage OCP* (`healing.occ_wireframe`, kernel OpenCASCADE) : effondre les micro-arêtes
+     en préservant le solide. Import **tolérant aux versions** d'OCP. Comme ce nettoyage peut
+     **sur-nettoyer** certaines pièces (arêtes utiles effondrées → hexa écrasés), quand il a
+     réellement modifié la géométrie le SC8R est tenté **sur la géométrie nettoyée ET sur la
+     brute** et le **meilleur résultat** est retenu (pas de double coût sinon).
+
+Après l'analyse, un **avis de faisabilité SC8R** (`analyze/feasibility`) donne un score 0..1
+et un verdict (sc8r / hard / tet), calculés sur les caractéristiques (couverture de peau,
+équilibre des deux peaux, faces en échec), journalisés et repris dans `summary.csv` / le JSON —
+utile pour trier une campagne. Déviation directe vers le tétra seulement si
+`mesh.skip_sc8r_below > 0` (désactivée par défaut, seuils à calibrer sur une vraie campagne).
 3. **Tri des surfaces utiles.** Rayons lancés vers l'intérieur de la matière depuis une
    triangulation grossière (KDTree par classes de taille + Möller-Trumbore vectorisé, aucune
    requête OCC point par point) : épaisseur locale et face opposée de chaque face. Chaque face

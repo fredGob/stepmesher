@@ -60,6 +60,15 @@ Pipeline d'une pièce (`process.py::process_part`) :
    si le nombre de solides change, dV/V > `occ_wireframe_max_volume_change`, ou forme invalide
    → géométrie brute conservée. OCP absent → nettoyage désactivé (`unavailable`). OCP et gmsh
    cohabitent dans le même processus ; les sous-processus (spawn) n'importent pas OCP.
+   Import OCP **tolérant aux versions** (méthodes statiques `_s`/sans `_s`, `TopExp_Explorer`
+   si le map indexé a disparu). **Le nettoyage OCP peut sur-nettoyer** (effondrer des arêtes
+   utiles → hexa écrasés, ex. part_001) : quand OCP a réellement nettoyé, le SC8R est tenté
+   **sur la géométrie nettoyée ET sur la brute**, meilleur retenu (part_201 profite du nettoyage,
+   part_001 récupère son SC8R). Pas de double coût si OCP n'a rien changé.
+0bis. **Avis de faisabilité SC8R** (`analyze/feasibility`) : score 0..1 + verdict
+   (sc8r / hard / tet) sur les features (couverture de peau, équilibre des peaux, faces en échec),
+   journalisé + `summary.csv`/JSON (triage). Déviation directe vers le tétra seulement si
+   `[mesh] skip_sc8r_below > 0` (désactivée par défaut, à calibrer sur une campagne).
 1. **Passe A, géométrie brute** : `jobs.prepare_job` → `analyze/pipeline.prepare_part`
    (import `occ/loader`, analyse, bouchage de trous `occ/holes`, brep réécrit).
    Massive / sans peau → tétra direct.

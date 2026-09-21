@@ -37,37 +37,67 @@ def clean_step(src, out_path, precision: float = 0.05, max_tolerance: float | No
         from OCP.ShapeFix import ShapeFix_Wireframe
         from OCP.GProp import GProp_GProps
         from OCP.BRepGProp import BRepGProp
-        from OCP.TopExp import TopExp
+        from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_EDGE, TopAbs_SOLID
-        from OCP.TopTools import TopTools_IndexedMapOfShape
         from OCP.TopoDS import TopoDS
         from OCP.BRep import BRep_Tool
         from OCP.BRepCheck import BRepCheck_Analyzer
     except Exception as e:  # noqa: BLE001 - OCP absent : nettoyage simplement desactive
         return CleanResult("unavailable", src, [f"OCP indisponible ({type(e).__name__})"])
+    # `TopTools_IndexedMapOfShape` a disparu de certaines versions d'OCP ; le comptage
+    # passe alors par TopExp_Explorer (API stable) avec dé-duplication par hash de shape.
+    try:
+        from OCP.TopExp import TopExp
+        from OCP.TopTools import TopTools_IndexedMapOfShape
+    except Exception:  # noqa: BLE001
+        TopExp = TopTools_IndexedMapOfShape = None
 
     if max_tolerance is None:
         max_tolerance = precision
 
-    def _count(shape, kind):
-        m = TopTools_IndexedMapOfShape()
-        TopExp.MapShapes_s(shape, kind, m)
-        return m
+    # Les méthodes statiques d'OCP sont exposées avec ou sans suffixe `_s` selon la
+    # version (`TopoDS.Edge_s` vs `TopoDS.Edge`) : on sélectionne celle qui existe.
+    def _s(obj, name):
+        return getattr(obj, name + "_s") if hasattr(obj, name + "_s") else getattr(obj, name)
+
+    _edge_of = _s(TopoDS, "Edge")
+    _degenerated = _s(BRep_Tool, "Degenerated")
+    _lin_props = _s(BRepGProp, "LinearProperties")
+    _vol_props = _s(BRepGProp, "VolumeProperties")
+    _map_shapes = _s(TopExp, "MapShapes") if TopExp is not None else None
+
+    def _iter_kind(shape, kind):
+        """Sous-shapes uniques de type `kind` (arête partagée comptée une fois)."""
+        if TopTools_IndexedMapOfShape is not None:
+            m = TopTools_IndexedMapOfShape()
+            _map_shapes(shape, kind, m)
+            for i in range(1, m.Extent() + 1):
+                yield m.FindKey(i)
+            return
+        seen = {}
+        ex = TopExp_Explorer(shape, kind)
+        while ex.More():
+            e = ex.Current()
+            seen.setdefault(hash(e), e)   # Explorer visite 2x les arêtes partagées
+            ex.Next()
+        yield from seen.values()
+
+    def _count_kind(shape, kind):
+        return sum(1 for _ in _iter_kind(shape, kind))
 
     def _volume(shape):
         g = GProp_GProps()
-        BRepGProp.VolumeProperties_s(shape, g)
+        _vol_props(shape, g)
         return g.Mass()
 
     def _small(shape):
-        m = _count(shape, TopAbs_EDGE)
         n = 0
-        for i in range(1, m.Extent() + 1):
-            e = TopoDS.Edge_s(m.FindKey(i))
-            if BRep_Tool.Degenerated_s(e):
+        for s in _iter_kind(shape, TopAbs_EDGE):
+            e = _edge_of(s)
+            if _degenerated(e):
                 continue
             g = GProp_GProps()
-            BRepGProp.LinearProperties_s(e, g)
+            _lin_props(e, g)
             if g.Mass() < precision:
                 n += 1
         return n
@@ -81,7 +111,7 @@ def clean_step(src, out_path, precision: float = 0.05, max_tolerance: float | No
     except Exception as e:  # noqa: BLE001
         return CleanResult("error", src, [f"lecture OCP : {type(e).__name__}"])
 
-    n_solids0 = _count(shape, TopAbs_SOLID).Extent()
+    n_solids0 = _count_kind(shape, TopAbs_SOLID)
     if n_solids0 == 0:
         return CleanResult("unchanged", src, ["aucun solide : nettoyage OCP ignore (couture gmsh)"])
     n_small0 = _small(shape)
@@ -103,7 +133,7 @@ def clean_step(src, out_path, precision: float = 0.05, max_tolerance: float | No
         return CleanResult("error", src, [f"ShapeFix_Wireframe : {type(e).__name__}"],
                            dict(n_solids=n_solids0, n_small=n_small0))
 
-    n_solids1 = _count(cleaned, TopAbs_SOLID).Extent()
+    n_solids1 = _count_kind(cleaned, TopAbs_SOLID)
     n_small1 = _small(cleaned)
     dv = abs(_volume(cleaned) - v0) / max(abs(v0), 1e-30)
     valid = bool(BRepCheck_Analyzer(cleaned).IsValid())
