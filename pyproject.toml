@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+clean = ["cadquery-ocp>=7.8"]   # kernel OpenCASCADE (module OCP) : nettoyage géométrique du STEP
+                                # avant maillage (ShapeFix_Wireframe). Optionnel : sans lui, le
+                                # nettoyage OCP est simplement désactivé (géométrie brute conservée).
 
 [project.scripts]
 stepmesher = "stepmesher.cli:main"

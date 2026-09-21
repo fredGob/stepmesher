@@ -4,6 +4,7 @@ Un faux llama-server (http.server) répond ce que le test veut ; aucun modèle n
 """
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
@@ -79,10 +80,20 @@ def test_payload_is_bounded():
 
 
 def test_payload_contains_part_summary():
-    st = build_state(_pa(), _attempts(2), "brute")
+    attempts = _attempts(2)
+    attempts[0]["internal_jacobian_min"] = -0.01234
+    st = build_state(_pa(), attempts, "brute")
     assert st["piece"]["nature"] == "variable"
     assert st["piece"]["paliers_mm"] == [3.2, 5.9]
     assert st["piece"]["geometrie"] == "brute"
+    assert st["essais"][0]["jacobien_interne_min"] == -0.01234
+
+
+def test_system_prompt_prioritizes_sc8r():
+    from stepmesher.llm.schema import SYSTEM_PROMPT
+
+    assert "objectif prioritaire est d'obtenir un maillage SC8R/hexaédrique" in SYSTEM_PROMPT
+    assert "Le tétraédrique est un dernier recours" in SYSTEM_PROMPT
 
 
 # --- décisions ------------------------------------------------------------
@@ -129,6 +140,39 @@ def test_tet_and_microfix_signals(server):
                      allow_microfix=True).action == "microfix"
     assert a.propose(build_state(_pa(), _attempts(2), "brute"), Recipe(), _res(), {7, 8}, set(),
                      allow_microfix=False).action is None
+
+
+@pytest.mark.parametrize("action", ["microfix", "tet"])
+def test_terminal_llm_action_keeps_sc8r_candidates(monkeypatch, tmp_path, action):
+    from stepmesher.config import load_config
+    from stepmesher.llm.advisor import Decision
+    from stepmesher.process import _sc8r_pass
+
+    cfg = load_config(overrides={
+        "general": {"max_attempts": 2},
+        "mesh": {"strategies": ["conform"], "size_variants": [1.0, 0.7], "adaptive_attempts": 1},
+    })
+    pa = _pa()
+    calls = []
+
+    def fake_attempt(*args, **kwargs):
+        calls.append(args)
+        return dict(status="failed", exec_status="ok", reasons=["face non maillée"], metrics={},
+                    passed=False, faces_not_meshed=[4])
+
+    class MicrofixAdvisor:
+        enabled = True
+
+        @staticmethod
+        def propose(*args, **kwargs):
+            return Decision(action=action, reason="piste à vérifier")
+
+    monkeypatch.setattr("stepmesher.process.run_isolated", fake_attempt)
+    report = {"attempts": []}
+    _sc8r_pass(pa, "analysis.json", tmp_path, cfg, report, time.time(), "A",
+               advisor=MicrofixAdvisor(), allow_microfix=True)
+
+    assert len(calls) > 1
 
 
 def test_schema_is_sent_to_server(server):

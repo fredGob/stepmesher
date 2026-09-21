@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from stepmesher.io.inp_validator import read_mesh, validate_inp
-from stepmesher.mesh.quality import HEX_CORNERS, scaled_jacobian
+from stepmesher.mesh.quality import HEX_CORNERS, hex_internal_jacobian, scaled_jacobian
 from stepmesher.testdata.synth import EXPECTED
 
 CONSTANT = [n for n, e in EXPECTED.items() if e["kind"] == "constant"]
@@ -46,6 +46,18 @@ def test_c3d10_midnodes_abaqus_order(meshed):
         for k, (a, b) in enumerate(((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3))):
             mid = 0.5 * (X[c[a]] + X[c[b]])
             assert np.linalg.norm(X[c[4 + k]] - mid) < 1e-6 + 0.05 * np.linalg.norm(X[c[a]] - X[c[b]])
+
+
+def test_internal_jacobian_detects_hidden_inversion():
+    X = np.array([
+        [1.1832, 2.0311, -0.0427], [1.0382, -0.5758, -0.0572],
+        [2.8826, -0.1047, -0.1554], [1.7720, 1.6870, 0.3499],
+        [-0.4955, 0.1389, 0.2733], [1.1576, -1.9515, 1.7535],
+        [1.3558, 0.9367, 0.5706], [-0.9842, 1.8005, -0.2882],
+    ], float)
+    conn = np.arange(8, dtype=np.int64).reshape(1, 8)
+    assert scaled_jacobian(X, conn, HEX_CORNERS)[0] > 0
+    assert hex_internal_jacobian(X, conn)[0] < 0
 
 
 @pytest.mark.parametrize("name", CONSTANT)

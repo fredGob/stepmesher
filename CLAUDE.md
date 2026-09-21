@@ -12,6 +12,7 @@ Utilisateur : Fred, ingénieur simulation (Airbus), francophone. Répondre en fr
 
 ```bash
 pip install -e .                                   # + apt: libglu1-mesa libxft2 libxinerama1 libxcursor1 libfontconfig1 libxrender1
+pip install -e .[clean]                             # + kernel OCP (cadquery-ocp) : nettoyage géométrique du STEP
 stepmesher mesh stps_test/ -o out/                  # lot ; summary.csv + par pièce .inp/.vtu/.json/.log/_orientation.csv
 stepmesher inspect piece.stp                        # analyse seule
 stepmesher validate out/piece.inp                   # validateur interne
@@ -31,8 +32,8 @@ Les 5 pièces de `stps_test/` passent :
 | part_000 | OK | ~4 500 SC8R | tôle constante 4,34 mm, 3 plis, 5 s |
 | part_093 | OK_TET | ~210 000 C3D10 | jonction en T → SC8R impossible, repli tétra, ~6 min |
 | part_145 | OK_APPROX | ~17 300 SC8R | 6 paliers, recette adaptative (5 faces remaillées) |
-| part_201 | OK_APPROX | ~12 800 SC8R | 3 paliers, 1 280 BSpline, premier essai |
-| part_349 | OK_APPROX | ~67 300 SC8R | 3 paliers, 36 faces remaillées, ~5 min |
+| part_201 | OK_APPROX | ~12 000 SC8R | 3 paliers ; **133 micro-arêtes effondrées par nettoyage OCP**, sans quoi FAILED_QUALITY (éléments écrasés) |
+| part_349 | OK_APPROX | ~66 700 SC8R | 3 paliers, 36 faces remaillées, ~5 min |
 
 Décisions validées avec Fred :
 - tolérance « soft » **0,2 %** d'éléments hors cibles (critères durs jamais relâchés) ;
@@ -47,6 +48,15 @@ Décisions validées avec Fred :
 ## Architecture (`src/stepmesher/`)
 
 Pipeline d'une pièce (`process.py::process_part`) :
+0. **Nettoyage OCP** (`occ/clean.py`, `_clean_step_occ`, `[healing] occ_wireframe`) : effondrement
+   des micro-arêtes (< `occ_wireframe_precision_mm`, défaut 0,05 mm) via
+   `ShapeFix_Wireframe.FixSmallEdges` du kernel OpenCASCADE (module OCP, `cadquery-ocp`),
+   écrit un STEP nettoyé repris par toute la suite. Contexte de partage global cohérent —
+   là où `ShapeFix_Wire.FixSmall` par contour, `UnifySameDomain`, `Defeaturing`, `Sewing` et
+   `OCCFixSmallEdges` de gmsh cassent le solide ou n'ont aucun effet sur les slivers. Rejeté
+   si le nombre de solides change, dV/V > `occ_wireframe_max_volume_change`, ou forme invalide
+   → géométrie brute conservée. OCP absent → nettoyage désactivé (`unavailable`). OCP et gmsh
+   cohabitent dans le même processus ; les sous-processus (spawn) n'importent pas OCP.
 1. **Passe A, géométrie brute** : `jobs.prepare_job` → `analyze/pipeline.prepare_part`
    (import `occ/loader`, analyse, bouchage de trous `occ/holes`, brep réécrit).
    Massive / sans peau → tétra direct.
@@ -61,7 +71,8 @@ Pipeline d'une pièce (`process.py::process_part`) :
    envoie l'état (`llm/payload.build_state`, borné) à llama-server avec un schéma JSON
    (`llm/schema`), reçoit UNE action, et le code applique le levier via
    `strategy/levers.apply_lever`. Faces inventées filtrées, valeurs bornées, toute panne
-   -> règles déterministes. Actions `tet` / `microfix` remontent en signal à `process_part`.
+   -> règles déterministes. Les suggestions `tet` et `microfix` sont tracées, mais ne
+   court-circuitent jamais les essais SC8R; le pipeline seul déclenche le repli après épuisement.
    Décisions journalisées dans le `.json` (clé `llm`). Testé avec un faux serveur HTTP
    (`tests/test_llm.py`), aucun modèle requis.
 5. Export `io/inp_writer` (+ `write_inp_tet`), `io/exports` (.vtu, CSV), validation
@@ -78,9 +89,11 @@ Modules clés :
 - `mesh/repair.py` : `flip_repair` (bascule + lissage, critère = pire quad remplacé sans
   dégrader les voisins), `fix_micro_edges` (glissement de nœuds).
 - `mesh/offset.py` : normales CAD moyennées, onglet `1/cos(θ/2)`, rayons vers peau opposée +
-  chants, `nearest_cad` (projection CAD exacte), nœuds sans cible = déplacement des voisins,
-  `_untangle`.
-- `mesh/quality.py` : critères durs / cibles, exemption « imposé par la CAD »
+   chants, avec second lancer vers la peau opposée si une tôle constante touche un chant avant
+   75 % de son épaisseur ; `nearest_cad` (projection CAD exacte), nœuds sans cible = déplacement
+   des voisins, `_untangle`.
+- `mesh/quality.py` : critères durs / cibles, jacobien aux coins et déterminant trilineaire
+   interne SC8R (grille 3x3x3), exemption « imposé par la CAD »
   (bord < `micro_edge_ratio` × `min_size_mm`, jamais pour les retournés), score.
 - `mesh/tet.py` : C3D10 ordre Abaqus retrouvé par géométrie, nœuds milieux droits si
   éléments courbes invalides, `HighOrderOptimize=0` (PETSc absent).
@@ -95,6 +108,10 @@ pendant un lot fait planter les sous-processus** (ils relisent le fichier).
 - Scripts utilisant `run_isolated` : garde `if __name__ == "__main__":` obligatoire (spawn).
 - Supprimer les micro-arêtes à l'import casse certaines BSpline (face non maillée,
   surfaces auto-intersectantes pour le tétra) → géométrie brute d'abord.
+- Nettoyage OCP : un STEP sans **solide** (compound/shell) casse tout (analyse « massive »,
+  épaisseur fausse, gmsh « aucun solide ») → `clean_step` exige `n_solids` inchangé.
+  `ShapeFix_Wire.FixSmall` par contour retire bien les arêtes mais **détruit le solide** ;
+  seul `ShapeFix_Wireframe.FixSmallEdges` (contexte global) le préserve.
 - La stratégie `compound` globale plante / dépasse les délais sur CATIA : retirée des défauts.
 - `threads > 1` : gmsh non déterministe (± quelques dizaines d'éléments).
 - Les `.inp` sont écrits en ASCII pur (`to_ascii`) : pas d'accents dans Abaqus.
@@ -109,8 +126,11 @@ pendant un lot fait planter les sous-processus** (ils relisent le fichier).
 
 ## Pistes futures (par priorité proposée)
 
-1. **Campagne sur plus de pièces** (Fred teste) : collecter les `.json` d'échec, classer les
-   causes (face non maillée, retournés aux raccords, reprojection, délais) avant de coder.
+1. **Relance et analyse de campagne complète** : vérifier d'abord l'intelligence effective du
+   conseiller LLM sur les cas réels (priorité SC8R, utilisation des métriques dont jacobien
+   interne, jamais de repli prématuré), puis collecter tous les `.json` / `.inp` et classer les
+   causes (face non maillée, retournés aux raccords, reprojection, délais, tétras non massifs)
+   avant de coder davantage.
 2. **Retour datacheck Abaqus** : corriger le writer selon les 4 points ci-dessus.
 3. **Mémoire de recettes SQLite** (jalon 2) : l'empreinte (hash exact invariant + vecteur de
    caractéristiques) est déjà dans le JSON ; statuts `EXACT_HIT` / `SIMILAR_HIT` /
