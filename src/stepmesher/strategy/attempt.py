@@ -58,7 +58,11 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
             res["micro_edge_moves"] = fix_micro_edges(qm, cfg["mesh"]["micro_edge_ratio"] * cfg["mesh"]["min_size_mm"])
             if cfg["mesh"]["local_repair"]:
                 t_r = time.time()
-                res["quad_repairs"] = flip_repair(qm, qm.fixed, threshold=cfg["mesh"].get("repair_threshold", 0.2))
+                q = cfg["quality"]
+                res["quad_repairs"] = flip_repair(
+                    qm, qm.fixed, threshold=cfg["mesh"].get("repair_threshold", 0.2),
+                    shape=dict(max_angle_deg=q["max_angle_deg"], min_angle_deg=q["min_angle_deg"],
+                               max_aspect_ratio=q["max_aspect_ratio"]))
                 res["timings"]["repair"] = time.time() - t_r
             meshed_faces = set(np.unique(np.r_[qm.quad_face, qm.tri_face]).tolist())
             missing = sorted(set(pa.ref_faces) - meshed_faces)
