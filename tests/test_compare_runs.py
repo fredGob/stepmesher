@@ -28,3 +28,16 @@ def test_compare_flags(tmp_path):
     assert "REGRESSION statut" in rows["p2"]
     assert "gain statut" in rows["p3"] and not any(f.startswith("REGRESSION") for f in rows["p3"])
     assert cr.main([str(a), str(b)]) == 1
+
+
+def test_compare_topologie(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d, n_irr in ((a, 40), (b, 150)):
+        d.mkdir()
+        r = dict(part="p1", status="OK", analysis=dict(kind="constant"), timings=dict(total=1.0),
+                 metrics=dict(n_elements=1000, scaled_jacobian=dict(min=0.5), topology=dict(n_irregular=n_irr, n_faces=2)))
+        (d / "p1.json").write_text(json.dumps(r), encoding="utf-8")
+    rows = {r["part"]: r["flags"] for r in cr.compare(cr.load_run(a), cr.load_run(b))}
+    assert any(f.startswith("REGRESSION topologie") for f in rows["p1"])
+    rows = {r["part"]: r["flags"] for r in cr.compare(cr.load_run(b), cr.load_run(a))}
+    assert any(f.startswith("gain topologie") for f in rows["p1"])

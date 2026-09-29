@@ -284,8 +284,8 @@ conservés, arêtes vives, choix de la peau de référence, paliers d'épaisseur
 orthonormalité des repères, invariance du hash par déplacement rigide, confinement des
 plantages et délais, garde-fou de performance.
 
-État : **92 tests verts** (85 synthétiques en ~4 min, dont 12 sur le conseiller LLM avec un
-faux llama-server, et 7 sur pièces réelles en ~20 min).
+État : tests synthétiques (`pytest -m "not real"`) + 7 sur pièces réelles (~20 min).
+Conseiller LLM retiré (sept. 2026) : recherche de recette déterministe seule.
 
 ### Pièces réelles `stps_test/` (conteneur 2 cœurs / 7 Go)
 
@@ -313,7 +313,7 @@ passent en géométrie brute (passe A).
   représenter en SC8R.
 - **Mémoire de recettes** : l'empreinte (hash exact invariant + vecteur de caractéristiques)
   est calculée et stockée dans le JSON ; la base SQLite et la réutilisation ne sont pas encore
-  branchées (statut mémoire toujours `NEW`). LLM optionnel : non fait.
+  branchées (statut mémoire toujours `NEW`).
 - **Temps** : les grosses pièces à épaisseur variable demandent plusieurs essais
   (3 à 5 min par essai sur part_349 avec 2 cœurs).
 - **Déterminisme** : avec `threads > 1`, gmsh peut produire quelques éléments de plus ou de

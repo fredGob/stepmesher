@@ -17,11 +17,19 @@ stepmesher mesh stps_test/ -o out/                  # lot ; summary.csv + par pi
 stepmesher inspect piece.stp                        # analyse seule
 stepmesher validate out/piece.inp                   # validateur interne
 stepmesher dump-config                              # config par défaut (src/stepmesher/default.toml)
-pytest -m "not real"                               # 85 tests synthétiques, ~4-5 min
+pytest -m "not real"                               # 137 tests synthétiques, ~1 min (20 cœurs)
 pytest -m real                                     # 7 tests sur stps_test/, ~20 min
+cp -r src /tmp/vN_src && tools/run_campaign.sh campagne/parts_stp_echelle result_vN 10 /tmp/vN_src
+                                                   # campagne en parallèle (Linux), 1 processus/pièce
 ```
 
-Environnement de dev utilisé : 2 cœurs / 7 Go → les temps sont pessimistes.
+Environnements : conteneur 2 cœurs / 7 Go (anciens temps) ; poste Windows de Fred (AGENTS.md) ;
+**machine Linux de Fred** (Fedora, 20 cœurs / 30 Go) : venv `.venv/` du projet (Python 3.12,
+gmsh 4.15.2, cadquery-ocp) -> `.venv/bin/stepmesher`, le python système n'a aucun paquet.
+**Campagnes de Fred** (`campagne/`) : `parts_stp_echelle` (44 pièces, ex-`stps_test` étendu) et
+`steps_upper` (8 grandes pièces : cadres 2-7 m, part_011 = coque supérieure 11 m / 128 m²).
+Fred visualise avec `mesh-viewer.html` (lit les `.inp`). **Ne jamais modifier `src/` pendant
+une campagne** : les essais en sous-processus réimportent le code (lancer depuis une copie figée).
 
 ## ⚠ PROCHAINE TÂCHE PRIORITAIRE (retour de Fred, 28/09/2026) — qualité visuelle du maillage
 
@@ -88,16 +96,213 @@ bouts (arêtes de 1 mm sur la peau -> gradation arêtes courtes + parité 2 segm
   mais **replie des éléments dans le vide de l'encoche** sans que la qualité le voie -> NE PAS
   monter `occ_wireframe_precision_mm_deep`. Les contrôles d'arcs sur .vtu par
   `gmsh getClosestPoint` sur BSpline sont faux (renvoie l'extrémité).
-- **EN COURS (29/09/2026 ~09:08)** : campagne 44 pièces avec `contour_arcs` lancée ->
+- **CADUC (autre machine ; ni ce code ni `result_v8`/`result_v9` ne sont arrivés sur la machine
+  Linux, voir « 29/09/2026 après-midi » ci-dessous)** — (29/09/2026 ~09:08) : campagne 44 pièces avec `contour_arcs` lancée ->
   `result_v9/` (journal `result_v9_run.log`, config par défaut). À faire ensuite :
   `python tools/compare_runs.py result_v8 result_v9`, vérifier statuts, nb d'éléments,
   small_pct/jump_pct, puis vues zoomées des coins arrondis (004 d'abord). Si la campagne a été
   coupée : la relancer (même commande, `-o result_v9`). Sauvegarde du code modifié :
   `~/stepmesher_backup_20260929_contour_arcs.zip`. En attente de Fred : (a) accepter ou non les
   2 éléments de 0,5 mm aux bouts de l'arc R5 de 004 ; (b) ajouter ou non la suppression OCP des
-  facettes de chant quelconques (4/6 sur 004), à valider sur une campagne.
+  facettes de chant quelconques (4/6 sur 004), à valider sur une campagne -> (b) : OUI (Fred,
+  29/09 après-midi), fait.
 
-Piste de travail (à discuter avec Fred avant de coder) :
+**29/09/2026 après-midi (machine Linux, campagnes `campagne/`) — état du code réel** : le code
+reçu était celui du 28/09 : `contour_arcs` décrit ci-dessus N'Y ÉTAIT PAS (réécrit), `llm/` et
+`levers.py` encore présents (supprimés, accord de Fred). Référence refaite sur cette machine :
+`result_base_echelle` (42/44, 012 et 021 FAILED_QUALITY, 29,8 % de petits éléments en moyenne) et
+`result_base_upper` (000/009/022 en « plis libres » à 86-92 % de petits éléments, 001
+FAILED_QUALITY, 011 FAILED). Causes trouvées et corrections (campagnes v1 à v5) :
+- **arête CAD de ~1 mm sur un contour lisse -> 2 segments de 0,5 mm (parité full-quad) ->
+  élancement 11-17 hors cibles -> recette nominale rejetée** au profit de « plis libres » ou
+  x0,5 (3-4 fois plus d'éléments, part_016/017/012) : **`repair.relax_boundary`** (après
+  `fix_micro_edges`) redistribue les nœuds le long du contour entre ancrages (coins > 25°,
+  faces transfinies, trous, intérieur des arcs imposés), lissage local, accepté si l'élancement
+  s'améliore sans dégrader le jacobien (`[mesh] boundary_relax*`) ; 016 : 1 017 -> 246 él. ;
+- **nœuds lissés hors de la surface** (lissage laplacien 3D de `flip_repair` / relaxation : sur
+  un pli R8, 4 nœuds à 1,7 mm DANS la matière -> écart d'épaisseur 0,53, part_021 ; upper 000) :
+  `attempt.reproject_moved` ramène tout nœud déplacé sur sa face CAD (getClosestPoint) ;
+- **plis coupés en tranches plus courtes que l'arc** (cadres upper : arc 9,8 mm, tranche 1,75 mm) :
+  `_bend_sides(by_turn=True)` prend pour génératrices les courbes DROITES (rotation de tangente
+  < 10°) ; avant, les arcs -> conflit de comptes, face libre, triangles + gauchissement ->
+  « plis libres » gagnait (upper 022 : 31 747 -> 11 140 él.) ;
+- **parité par courbe dans les chaînes découpées** : `_split_count(..., even=)` (plis, petites
+  faces transfinies) : une micro-courbe partagée avec une face libre recevait 1 segment ->
+  « 1D mesh cannot be divided by 2 » ; `structured_patches` : élancement <= 6 (sens long redécoupé) ;
+- **`contour_arcs` réécrit** (après `merge_micro_curves`, arcs fusionnés ou < 0,5 h0 exclus) :
+  PLAFOND « 3 éléments dans un rayon, pas plus » : n = max(L/h0, min(1 él./30°, L/(0,35 h0))),
+  pair -> R4-R5 à 90° : 2 segments, R13 : 4 ; l'ancienne règle (4 segments forcés) mettait
+  4 x 1,6 mm sur R4 (rosettes, 016). 004 : le coin R5 à 12 segments disparaît ;
+- **facettes de chant** (Fred : « les supprimer ») : `clean._defeature_chant_fillets` généralisé
+  (4 arêtes : 2 ~ t, 2 <= 3 mm, `occ_chant_facet_max_width_mm`) ; toutes d'un coup, sinon une
+  par une (60 s). **Défaut de BRepAlgoAPI_Defeaturing** : il crée souvent des arêtes de 0-0,3 mm
+  près des coins (014 : 10 créées) -> suppression refusée si elle crée une arête < t/4, si
+  |dV| > 3 x aire x t des facettes ou si plus de faces disparaissent que demandé ; lancé en
+  sous-processus avec délai `occ_chant_timeout_s` = 90 s (un seul appel : 334 s sur upper 018).
+  Gain réel limité (1 à 5 facettes par pièce) : la relaxation du contour fait l'essentiel ;
+- `occ_wireframe_precision_mm` 0,05 -> **0,1** : une courbe de 0,096 mm coupée en 2 (parité)
+  donnait des arêtes de 0,048 < 0,05 (critère dur, 014, upper 001/018). Tétra : sources
+  supplémentaires = STEP d'entrée nettoyé OCP 0,05 mm puis tel quel (`tet_sources(extra_steps)`),
+  part_001 (0,027 < 0,03 au nettoyage 0,1 mm) ;
+- décalage (`offset`) : rayon de bord libre qui touche un chant incliné avant 75 % de t et second
+  rayon qui manque la peau opposée -> point le plus proche de la peau opposée si l'épaisseur est
+  plausible (029 : 1,34 mm pour 2,71 sur un arc de contour) ; nœud relaxé dont le décalage dévie
+  -> remis au sommet CAD ;
+- **grandes pièces** : `flip_repair` borné à 120 s (sur 011 il tournait sans fin -> délais) ;
+  budget par essai/pièce x (éléments estimés / `budget_ref_elements` = 10 000), plafonds 3 600 /
+  14 400 s ; budget partagé entre variantes de géométrie (nettoyée 50 %, brute 75 %) ; pièce x5
+  et plus : une variante qui passe suffit ; triangulation d'analyse plafonnée à
+  `sample_size_max_mm` = 20 mm (1 % de 11 m = 110 mm -> erreur de reprojection 0,6) ; faces de
+  plus de `large_face_elements` = 20 000 éléments en algorithme 2D 6 (l'algo 8 fait 26 000
+  quads énormes et étirés sur une BSpline de 32 m² au lieu de 790 000) -> **upper 011 : 788 523
+  SC8R, passe, ~16 min, 1,7 Go**.
+Ancienne référence `result_v6_echelle` / `result_v6_upper` (011 copiée de v5, chemin de code
+identique ; ancienne référence de cette machine : `result_base_*`) :
+- echelle **43/44** (30 OK, 2 OK_APPROX, 11 OK_TET, 021 FAILED_QUALITY), petits éléments
+  29,8 -> **15,8 %** en moyenne, SC8R total 62 070 -> 49 311 (016 1 017 -> 246, 017 1 355 -> 258,
+  023 4 563 -> 1 508, 025 2 724 -> 1 399, 012 FAILED -> OK 803), ~11 min en parallèle (x11) ;
+- upper **8/8** (base : 011 FAILED, 001 FAILED_QUALITY), petits 48,5 -> **16,8 %** ; 000 31 778 ->
+  10 391, 009 33 331 -> 11 973, 022 31 747 -> 11 140, 001 -> OK_APPROX 20 572, **011 -> OK_APPROX
+  789 343 SC8R (1 essai de 855 s)** ; ~13 min (x7) + 18 min pour 011 ;
+- rendus avant/après : `result_v6_*/avant_apres/`.
+**Reste** : 021 (ligne CAD diagonale entre faces tangentes -> aiguilles, 7 hors
+cibles pour 5 ; la fusion en composite fait pire) ; temps x1,8 sur les petites pièces (suppression
+des facettes une par une + variantes) ; petits éléments restants = gradation autour des arêtes
+courtes intérieures (fins de lignes de tangence) et coins en chanfrein réels.
+
+**29/09/2026 soir — retour de Fred sur upper part_001 (pattes latérales 7,4 m x 36 mm « pas du
+tout régulières ») ; ordre validé : 1) détecteur, 2) correction des lanières** :
+- **Détecteur (fait, SIGNALEMENT seul, pas d'ELSET — décision de Fred)** : `quality.topology`
+  compte les nœuds intérieurs à 3 ou 5+ quads (« étoiles ») dans les faces qui DEVRAIENT être en
+  rangées régulières = `quad.regular_expected_faces` (une boucle, 4 coins réels = virage >= 30°
+  entre courbes >= 0,5 h0, côtés opposés rapport <= 2 -> pattes, lanières, plis, rectangles ; pas
+  les âmes de forme libre, où quelques étoiles sont normales). Sorties : `metrics.topology`
+  (faces fautives + position), log WARNING « maillage IRRÉGULIER », `summary.csv`
+  (`irregular_faces`, `irregular_nodes`), `compare_runs.py` (« REGRESSION topologie », colonne i),
+  pénalité de départage += `regularity_topology_weight` x %. Les critères par élément (petits,
+  sauts) ne voyaient rien : 001 = 400 étoiles pour 10 % de petits / 1,2 % de sauts. Sur v7 : 001
+  (400), echelle 010 (78), upper 000 (64), echelle 018 (51, face 214 x 140), 020/021 (47)... ;
+  petits clips : 0. Tests `tests/test_topology.py`.
+- **Cause sur 001** : la patte a 12 courbes (un grand côté = pli en 7 faces, l'autre = 1 courbe,
+  bouts en biais 32°/148° + chanfrein 1,9 mm) -> lanière rejetée (2 plus longues courbes prises
+  pour grands côtés) ET comptes des 2 plis voisins incompatibles.
+- **Planification harmonisée (faite, `[mesh] structured_harmonize = true`)** :
+  `quad.structured_plan` : plis + lanières + faces à 4 côtés (jusqu'à
+  `structured_patch_max_side_frac` = 8 h0) inventoriés ENSEMBLE, côtés par les 4 coins réels
+  (`_rect_sides` ; coin = sommet de plus fort virage, jamais un raccord tangent), repli sur
+  l'ancienne détection (`_strip_plan_legacy`, `_patch_plan_legacy` : lanière à bouts arrondis
+  tangents, 015 face 12) ; comptes harmonisés par AJOUT seulement (côtés opposés égaux, parité
+  des courbes bordant une face libre) ; face insoluble -> libre ; pas de solution -> ancien
+  enchaînement. `flip_repair` : pas de bascule dans une face transfinie sauf quad < 0,1
+  (sinon étoiles). 001 (géométrie profonde) : 29 -> 33 faces structurées, 0 hors cibles.
+- **Reste sur 001 : les 2 pattes** — leur bout se prolonge par une FACETTE DE CHANT de 1,9 mm
+  tangente au bout ; coin transfini au raccord tangent -> quad plat retourné ; coin au vrai
+  virage -> rangée de 1,9 mm sur 7,4 m ; suppression OCC de la facette : 178 s et 0/10 facettes ;
+  courbe composite gmsh : garde le nœud ; `addTrimmedSurface` (reconstruire la face avec bout +
+  chanfrein fusionnés) : « Could not create wire ». Pattes laissées libres (signalées). Piste :
+  topologie virtuelle sur la peau (OCP : coque de peau, fusion des arêtes tangentes du contour)
+  ou affaissement de la rangée fine après maillage — À DISCUTER avec Fred.
+- **Topologie virtuelle (faite, choix de Fred « la solution propre », `[mesh] virtual_topology`)** :
+  `occ/virtual.py` : sur les seules faces de peau (modèle de MAILLAGE, solide intact), courbes du
+  contour extérieur reliées par un sommet parasite (sur une seule face de peau, virage < 15°, une
+  des deux courbes < 3 mm) concaténées en BSpline EXACTE (GeomConvert_CompCurveToBSplineCurve),
+  face reconstruite sur la même surface (sens du contour choisi pour une aire > 0), autres arêtes
+  réutilisées (partage intact). Construit en fin d'analyse (`pipeline._virtual_skin`, ~1 s) :
+  `pa.skin_brep`, `skin_face_map` (face du modèle de peau -> face de brep), `skin_curve_map`
+  (courbe de brep -> courbe du modèle de peau, par distance point-segment 0,05 mm ; rejet si une
+  courbe de peau n'a pas de correspondance). L'essai maille dans cette numérotation
+  (`quad.skin_view` : faces hors peau en numéros NÉGATIFS ; `attempt._recipe_in`) puis revient à
+  celle de pa.brep juste avant le décalage (quad_face, listes structurées, faces attendues
+  régulières, faces non maillées). Tests `tests/test_virtual.py`.
+  Effet (v11 vs v10) : **echelle 44/44 (021 passe)**, petits 15,7 -> 9,2 %, SC8R 49 167 -> 45 502,
+  temps cumulé 78 -> 43 min, 009 332 -> 169 él., 031/033 passent à x1 au lieu de x0,7 (-40 %) ;
+  upper : **001 0 étoile (pattes régulières, 3 rangées)**, 018 72 -> 45 ; 020/021 40 -> 85 = face 7
+  (âme trapézoïdale 2,2 m x 161-258 mm, 4 coins, trop large pour une lanière, maillée en libre :
+  tirage différent), signalée dans les deux versions.
+- **Redressement des colonnes (fait, accord de Fred, `[mesh] align_columns`)** : le transfini
+  relie le k-ième nœud d'un côté au k-ième de l'autre -> côtés de longueurs différentes (pattes de
+  001 : 7 405 / 7 330 mm, bouts en biais) = colonnes penchées ~45° sur 7 m (décalage 20-60 mm).
+  `repair.align_columns` (après fix_micro_edges, AVANT flip_repair) : grille reconstruite
+  (`structured_grid`), nœuds d'un grand côté glissés sur la polyligne du côté pour faire face à
+  ceux de l'autre, transition près des bouts (2 x largeur + 3 x décalage), nœuds sur un sommet
+  CAD fixes, propagation de bande en bande par les côtés partagés (patte -> pli -> âme ...),
+  intérieurs par interpolation des déplacements, reprojection ensuite ; annulé si la qualité
+  baisse. 001 : décalage 0,0 mm de la colonne 20 à 759, jacobien p05 0,54 -> 0,99 (min 0,377
+  -> 0,351, angle min 20,8°). v12 vs v11 : 0 régression echelle, 018 étoiles 45 -> 18.
+  **Décision de Fred** : grandes faces à 4 coins trop larges pour une lanière (020/021 face 7,
+  âme 2,2 m x 161-258 mm) laissées en maillage libre pour l'instant (signalées).
+- Ancienne référence `result_v12_echelle` / `result_v12_upper` (+ redressement). Rendus :
+  `result_v12_upper/avant_apres/` (patte 86 en 3 étapes v6 / v11 / v12). Avant :
+  `result_v11_*` (supprimé) = topologie virtuelle ; `result_v10_*` (supprimé) = détecteur + planification harmonisée,
+  0 régression vs v7 (`compare_runs.py`) : echelle 43/44 (021), petits 15,7 %, 010 étoiles 78 -> 62 ;
+  upper 8/8, petits 16,8 -> 10,4 %, étoiles 000 64 -> 0, 009 20 -> 0, 022 7 -> 0, 001 400 -> 104
+  (les 2 pattes à chanfrein), 018 185 -> 72 ; +12-15 % d'éléments sur 001/018 (les lanières
+  prennent le pas des plis le long du profilé).
+
+**29/09/2026 soir (retour de Fred sur v12) — 3 défauts** :
+- **Maillage DISCONTINU sur une traverse (echelle 021, intercostale)** — le plus grave : fente de
+  16 mm entre pli et semelle, 31 nœuds de bord superposés (paires à 0,004 mm), un seul morceau
+  (`mesh_pieces` aveugle), .inp validé OK. Cause : la **passe B** (micro-arêtes supprimées à
+  l'import gmsh, `Geometry.OCCFixSmallEdges`) découd deux faces de peau ; ses essais passaient et
+  gagnaient. **Détecteur (fait, critère DUR)** : `quality.mesh_cracks` (nœud de bord à moins de
+  `crack_tol_mm` = 0,05 d'une autre arête libre non atteignable en suivant le bord sur moins de
+  `crack_min_path_mm` = 1 ; + arêtes partagées par 3+ éléments), dans `evaluate` (raison
+  « maillage DISCONTINU », score -1000) et dans `inp_validator` (idem + paires de nœuds confondus
+  < 0,005 mm sans élément commun, tous types d'éléments). v12 : seule 021 touchée (0 faux positif
+  sur 44 + 8 pièces, v6 propre). Tests `tests/test_cracks.py`.
+- **Rayon trop découpé (echelle 013, fond d'encoche R5 à 12 segments de 0,67 mm)** : les 2 bouts
+  de 0,86 mm (restes de facettes de chant) sont TANGENTS à l'arc, mais la topologie virtuelle
+  refusait la face (« concaténation impossible ») : tolérance fixe 1e-6 pour
+  `GeomConvert_CompCurveToBSplineCurve.Add`, écarts CATIA de 5e-6 à 1e-5 mm. **Corrigé** :
+  tolérance = max(`JOIN_TOL_MIN_MM` = 1e-4, 2 x tolérance du sommet) (`occ/virtual.py`). 013 :
+  arc à 4 éléments, petits 27 -> 13 %, jacobien min 0,17 -> 0,37 ; 014 petits 23 -> 4 %, 000
+  26 -> 4 %. 021 : la géométrie brute passe désormais sans passe B (1 497 él., continu).
+- **Petites arêtes sur upper 022 = SOYAGES** (confirmé par Fred) : décalage de 0,9 mm de la
+  semelle sur 7,2 mm (S en 3 tranches : arc 10°, droite, arc -10°), au droit des encoches ; le pli
+  âme/semelle ET la semelle sont découpés en tranches BSpline de 0,9 à 3,4 mm ; chaque courbe CAO
+  porte une colonne de nœuds, parité full-quad -> 6 colonnes de 0,5-1,7 mm dans la rampe (Fred :
+  « trop, si possible réduire »). Explique ~80 % des quads minuscules des cadres upper 000, 009,
+  022 ; invisible des critères de régularité (plis transfinis exemptés). **gmsh 4.15
+  `setCompound(2, ...)` garde les nœuds des courbes internes** (vérifié, comme en 1D).
+  **Fait : fusion des tranches (`occ/virtual.merge_slices`, `[mesh] virtual_slices*`)**, dans le
+  modèle de peau seulement : tranche = face à 4 arêtes dont 2 côtés opposés < 0,4 h0 ; tranches
+  voisines par leurs côtés longs et tangentes (< 5°) -> UNE face, surface de Coons
+  (`GeomFill_BSplineCurves`, courbes montées au degré 3) sur les 4 coins réels (plus forts
+  virages ; un côté peut garder un sommet), bords courts consécutifs concaténés en BSpline exacte,
+  la MÊME arête dans les faces voisines (âme reconstruite sur son plan) ; refus si écart > 0,05 mm
+  dans les deux sens (points des tranches -> surface ET points de la face -> tranches : la seule
+  aire ne suffit pas) ; un groupe refusé = recalcul sans lui (sinon arête concaténée d'un seul
+  côté = fissure). APRÈS la simplification des contours (un sommet parasite sur le bord libre
+  d'une tranche lui donnait 5 arêtes). `skin_face_groups` {représentant: tranches} ; `skin_view` :
+  o2n envoie chaque tranche sur la face fusionnée ; `attempt.reclassify_groups` rend chaque quad à
+  sa tranche d'origine (triangulation d'analyse) avant le décalage ; listes structurées étendues
+  aux tranches. 022 : 81 -> 49 faces de peau, bord libre identique (partage intact), écart
+  <= 0,022 mm ; 2 colonnes dans la rampe au lieu de 6. Tests `tests/test_virtual.py`.
+- Campagnes : `result_v13_*` (détecteur de fissure + tolérance de raccord ; 0 régression vs v12,
+  echelle 000/013/014 plus réguliers, 021 continu ; upper identique) ; rendus
+  `result_v13_echelle/avant_apres/`.
+- **RÉFÉRENCE = `result_v14_echelle` / `result_v14_upper`** (+ fusion des tranches) : echelle
+  identique à v13 (aucune tranche fusionnée) ; upper 000 10 656 -> 5 026 SC8R (petits 33 -> 7 %,
+  36 faces fusionnées), 009 10 578 -> 9 361 (29 -> 17 %), 022 10 572 -> 6 704 (15 -> 3 %) ;
+  hors cibles 009 79 -> 41, 022 43 -> 6 ; jacobien min un peu plus bas (000 0,28 -> 0,23, 009
+  0,23 -> 0,18, 022 0,38 -> 0,32 : maillage libre ailleurs, PAS dans les rampes fusionnées),
+  signalé « REGRESSION jacobien » par compare_runs ; 52 .inp continus et valides. Rendus
+  `result_v14_upper/avant_apres/`.
+- **Fred (29/09 soir)** : corrections 021 (fissure) et 013 (rayon) jugées correctes ; soyages :
+  « ça ira pour le moment ». Vocabulaire : « traverses » = famille `intercostale` (echelle
+  021-033) ; « rayon » = pli OU coin arrondi du contour (fond d'encoche compris) ; « edges trop
+  petits » = colonnes minuscules imposées par des courbes CAO rapprochées ; « maillage pas
+  continu » = faces qui ne partagent pas leurs nœuds (défaut le plus grave pour lui).
+- **Reste (non traité)** : upper 009 garde 17 % de petits éléments, AUTRE cause que les soyages
+  (non analysée) ; echelle 023/029 : quelques tranches de pli isolées (pas de groupe de 2+, non
+  fusionnées) ; jacobien min un peu plus bas sur 000/009/022 (voir ci-dessus) ; la passe B
+  (`OCCFixSmallEdges` gmsh) peut toujours découdre des faces : désormais rejetée par le critère de
+  fissure, pas empêchée à la source.
+- Outils de vérification utilisés : `stepmesher validate` (continuité incluse) sur tous les .inp
+  d'une campagne ; `tools/compare_runs.py vN vN+1` ; rendu avant/après d'une zone :
+  `result_pbm/diag_rayons/render_cmp.py avant.inp apres.inp out.png cx,cy,cz rayon [vue|-]`.
+
+Piste de travail du 28/09 (points 1 à 3 faits depuis : diagnostic, régularité, topologie) :
 1. diagnostic chiffré sur part_004 puis sur toute `result_v7` : par pli (toutes ses faces),
    nombre d'éléments en travers ; taille min / taille voisine (gradient) par face ;
 2. corriger la règle des plis multi-faces (3 éléments sur le pli complet) ;
@@ -200,8 +405,9 @@ Pipeline d'une pièce (`process.py::process_part`) :
 4. `_tet_fallback` : sources (brep préparé, STEP micro-fix 0,01 / 0,005, STEP brut) ×
    `TET_ALGOS`, chaque combinaison isolée (gmsh segfaulte parfois).
 4bis. **Conseiller LLM : retiré** (sept. 2026, décision de Fred, contre-productif). Module
-   `llm/`, `strategy/levers.py`, `[llm]`, options `--llm*` supprimés ; la montée gloutonne
-   déterministe de `_sc8r_pass` reste seule. Sauvegarde : `../stepmesher_backup_20260928.zip`.
+   `llm/`, `strategy/levers.py`, `tests/test_llm.py`, `[llm]`, options `--llm*` supprimés
+   (les fichiers traînaient encore dans le code du 28/09 : effacés le 29/09) ; la montée
+   gloutonne déterministe de `_sc8r_pass` reste seule.
 5. Export `io/inp_writer` (+ `write_inp_tet`), `io/exports` (.vtu, CSV), validation
    `io/inp_validator`, rapport JSON.
 

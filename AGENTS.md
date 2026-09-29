@@ -87,6 +87,12 @@ repris par toute la suite. **Systématique** (voulu par Fred).
 
 ## Chantier en cours / prochain pas
 
+**29/09/2026 après-midi (machine Linux)** : campagnes réelles dans `campagne/` (echelle 44 +
+upper 8) ; relaxation du contour, reprojection des nœuds lissés, génératrices des tranches de pli,
+facettes de chant, grandes pièces (budget, algo 6, analyse plafonnée). Détail et résultats :
+section « 29/09/2026 après-midi » de `CLAUDE.md`. Lancer les campagnes avec
+`tools/run_campaign.sh` depuis une copie figée de `src/`.
+
 **⚠ PRIORITAIRE (28/09/2026)** : Fred juge plusieurs maillages de `result_v7` « trop moches »
 malgré les critères OK : **trop d'éléments dans les rayons**, sauts de taille brutaux
 (part_004, pli R3 105° en 3 faces CAD -> ~9 rangées). Détail et piste : section
