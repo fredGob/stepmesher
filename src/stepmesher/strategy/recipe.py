@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 
 STRATEGIES = ("conform", "compound", "blossom", "subdiv", "qqs")
 
-# bornes appliquées à toute recette (y compris proposée par un LLM au jalon 4)
+# bornes appliquées à toute recette
 BOUNDS = dict(size_mult=(0.25, 3.0), n_per_bend=(2, 12), n_per_hole=(6, 48), tangent_angle_deg=(1.0, 30.0))
 
 
@@ -13,7 +13,7 @@ BOUNDS = dict(size_mult=(0.25, 3.0), n_per_bend=(2, 12), n_per_hole=(6, 48), tan
 class Recipe:
     strategy: str = "conform"
     size_mult: float = 1.0          # multiplicateur de la taille cible issue de la config
-    n_per_bend: int = 4
+    n_per_bend: int = 2
     n_per_hole: int = 12
     tangent_angle_deg: float = 10.0
     structured: bool = True         # plis (et petites faces à 4 côtés) en maillage transfini

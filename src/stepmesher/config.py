@@ -47,7 +47,11 @@ class Config:
 
     def target_size(self, diag: float, thickness: float) -> float:
         m = self.data["mesh"]
-        h = m["size_frac"] * diag
+        h_nom = m.get("nominal_size_mm", 0.0)   # .get : config d'un lot lancé avant l'ajout de la clé
+        if h_nom > 0:
+            h = h_nom * min(1.0, (max(diag, 1e-9) / m["nominal_ref_diag_mm"]) ** m["nominal_size_exponent"])
+        else:
+            h = m["size_frac"] * diag
         if thickness > 0:
             h = min(h, m["thickness_factor"] * thickness)
         return float(min(max(h, m["min_size_mm"]), m["max_size_mm"]))

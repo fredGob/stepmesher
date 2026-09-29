@@ -19,8 +19,8 @@ from ..mesh import quality
 from ..mesh.hexa import build_solid_shell
 from ..mesh.offset import offset_nodes
 from ..mesh.repair import fix_micro_edges, flip_repair
-from ..mesh.quad import apply_strategy, extract_reference_mesh, nodes_on_curves, setup_reference_model
-from ..mesh.sizing import apply_sizing
+from ..mesh.quad import apply_strategy, even_boundaries, extract_reference_mesh, nodes_on_curves, setup_reference_model
+from ..mesh.sizing import apply_sizing, base_size
 from ..occ.loader import gmsh_session
 from .recipe import Recipe
 
@@ -44,9 +44,22 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
         rc = Recipe.from_dict(recipe)
         with gmsh_session(cfg):
             setup_reference_model(pa)
-            res["sizing"] = apply_sizing(pa, cfg, rc)
-            res["strategy_info"] = apply_strategy(pa, rc, res["sizing"]["h0"], bool(cfg["mesh"].get("structured_patches", True)))
+            # stratégie (transfinis, fusion des micro-courbes) AVANT le champ de taille : les
+            # courbes fusionnées n'imposent plus de nœud et ne doivent plus être raffinées
+            res["strategy_info"] = apply_strategy(
+                pa, rc, base_size(pa, cfg, rc), bool(cfg["mesh"].get("structured_patches", True)),
+                float(cfg["mesh"].get("max_bend_angle_deg", 15.0)), float(cfg["mesh"].get("min_bend_size_frac", 0.0)),
+                bool(cfg["mesh"].get("bend_angle_floor", False)))
+            res["sizing"] = apply_sizing(pa, cfg, rc, set(res["strategy_info"].get("merged_curves", [])),
+                                         set(res["strategy_info"].get("structured_list", [])))
             t1 = time.time()
+            if gmsh.option.getNumber("Mesh.RecombinationAlgorithm") in (2, 3):
+                try:
+                    res["parity_fixes"] = even_boundaries(
+                        pa, set(res["strategy_info"].get("structured_list", [])) |
+                        set(res["strategy_info"].get("structured_patch_list", [])))
+                except Exception as e:  # noqa: BLE001
+                    res["parity_fixes"] = f"erreur : {e}"[:200]
             try:
                 gmsh.model.mesh.generate(2)
                 res["gmsh_warning"] = None
@@ -58,7 +71,11 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
             res["micro_edge_moves"] = fix_micro_edges(qm, cfg["mesh"]["micro_edge_ratio"] * cfg["mesh"]["min_size_mm"])
             if cfg["mesh"]["local_repair"]:
                 t_r = time.time()
-                res["quad_repairs"] = flip_repair(qm, qm.fixed, threshold=cfg["mesh"].get("repair_threshold", 0.2))
+                q = cfg["quality"]
+                res["quad_repairs"] = flip_repair(
+                    qm, qm.fixed, threshold=cfg["mesh"].get("repair_threshold", 0.2),
+                    shape=dict(max_angle_deg=q["max_angle_deg"], min_angle_deg=q["min_angle_deg"],
+                               max_aspect_ratio=q["max_aspect_ratio"]))
                 res["timings"]["repair"] = time.time() - t_r
             meshed_faces = set(np.unique(np.r_[qm.quad_face, qm.tri_face]).tolist())
             missing = sorted(set(pa.ref_faces) - meshed_faces)
@@ -100,7 +117,13 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
             off = offset_nodes(pa, qm, np.union1d(ns_free, ns_hole))
             res["timings"]["offset"] = time.time() - t2
         sm = build_solid_shell(qm, off, pa.obb_axes[0])
-        m, soft = quality.evaluate(sm, off, cfg, pa.kind)
+        quality_kind = pa.classification.get("thickness_kind", pa.kind)
+        m, soft = quality.evaluate(sm, off, cfg, quality_kind)
+        # régularité visuelle : taille NOMINALE (sans size_mult), plis transfinis exemptés
+        struct_bends = {f for b in pa.bends for f in b["faces"]} & set(res["strategy_info"].get("structured_list", []))
+        m["regularity"] = quality.regularity(
+            sm, res["sizing"]["h0"] / max(rc.size_mult, 1e-9), struct_bends,
+            float(cfg["quality"].get("regularity_jump_max", 1.5)), float(cfg["quality"].get("regularity_small_frac", 0.5)))
         res["metrics"] = m
         hf_all = np.r_[sm.hexa_face, sm.wedge_face]
         sj_h = quality.scaled_jacobian(sm.nodes, sm.hexa, quality.HEX_CORNERS)

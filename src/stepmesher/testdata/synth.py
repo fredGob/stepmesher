@@ -13,7 +13,7 @@ import gmsh
 EXPECTED = {
     "plaque_trouee":  dict(kind="constant", t=2.0, bends=0, holes_filled=2, holes_kept=1),
     "corniere_pliee": dict(kind="constant", t=2.0, bends=1, holes_filled=0, holes_kept=0),
-    "profile_u":      dict(kind="constant", t=1.6, bends=2, holes_filled=0, holes_kept=0),
+    "profile_u":      dict(kind="profile", t=1.6, bends=2, holes_filled=0, holes_kept=0),
     "bac_angles_vifs": dict(kind="constant", t=1.5, bends=0, holes_filled=0, holes_kept=0),
     "bloc_massif":    dict(kind="massive", t=None, bends=0, holes_filled=0, holes_kept=0),
     "plaque_poches":  dict(kind="variable", t=None, bends=0, holes_filled=0, holes_kept=0),

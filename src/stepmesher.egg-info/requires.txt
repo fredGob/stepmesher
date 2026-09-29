@@ -5,5 +5,8 @@ scipy>=1.10
 [:python_version < "3.11"]
 tomli>=2.0
 
+[clean]
+cadquery-ocp>=7.8
+
 [test]
 pytest>=7

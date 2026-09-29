@@ -1,10 +1,14 @@
-"""Export Abaqus .inp : SC8R (+ SC6R), sets, surfaces, orientation par élément, sections.
+"""Export Abaqus .inp : SC8R (+ SC6R), sets, surfaces, section unique.
 
-Aucun bloc matériau : les sections référencent MATERIAL=TBD, à définir par l'utilisateur.
+Aucun bloc matériau : la section référence MATERIAL=TBD, à définir par l'utilisateur.
 
 Note continuum shell : l'épaisseur mécanique d'un SC8R est portée par la géométrie
-nodale ; la valeur écrite dans *SHELL SECTION est l'épaisseur nominale mesurée de la
-zone (à confirmer lors du datacheck Abaqus, cf. README).
+nodale ; la valeur écrite dans *SHELL SECTION est une épaisseur nominale constante
+(moyenne des épaisseurs d'éléments du maillage), à confirmer lors du datacheck Abaqus.
+
+Orientation par élément retirée pour l'instant : les blocs *DISTRIBUTION / *ORIENTATION
+ne passaient pas tels quels dans *PART. L'orientation reste disponible dans le CSV
+`_orientation.csv` si besoin de la réintroduire plus tard.
 """
 from __future__ import annotations
 
@@ -64,7 +68,8 @@ def skin_areas(X: np.ndarray, H: np.ndarray, W: np.ndarray) -> tuple[float, floa
     return quad(H[:, :4]) + tri(W[:, :3]), quad(H[:, 4:]) + tri(W[:, 3:])
 
 
-def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: str) -> dict:
+def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: str,
+              part_name_override: str | None = None) -> dict:
     nodes = mesh["nodes"]
     N = int(mesh["n_ref"])
     H, W = mesh["hexa"], mesh["wedge"]
@@ -72,7 +77,8 @@ def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: s
     n_el = nh + nw
     faces = np.r_[mesh["hexa_face"], mesh["wedge_face"]].astype(int)
     thick = mesh["thickness"]
-    zone_of, zones = assign_zones(thick, pa.thickness_zones if pa.kind == "variable" else
+    variable = pa.classification.get("thickness_kind", pa.kind) == "variable"
+    zone_of, zones = assign_zones(thick, pa.thickness_zones if variable else
                                   [pa.classification["t_median"]])
     # zones effectivement utilisées, épaisseur de section = moyenne des éléments de la zone
     used = sorted(set(zone_of.tolist()))
@@ -94,7 +100,7 @@ def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: s
         f.write(f"** éléments : {nh} SC8R, {nw} SC6R ; 1 élément dans l'épaisseur\n")
         f.write("** nœuds 1-4 (1-3) sur la peau de référence, 5-8 (4-6) sur la peau opposée\n")
         f.write("** MATERIAL=TBD : bloc matériau à fournir\n")
-        f.write(f"*PART, NAME={part_name(pa.source)}\n")
+        f.write(f"*PART, NAME={part_name_override or part_name(pa.source)}\n")
         f.write("*NODE, NSET=NALL\n")
         for i, p in enumerate(nodes, 1):
             f.write(f"{i}, {p[0]:.9g}, {p[1]:.9g}, {p[2]:.9g}\n")
@@ -165,34 +171,24 @@ def write_inp(path: Path, mesh: dict, pa, recipe: dict, metrics: dict, status: s
                 f.write(f"ES_SC6R, {face}\n")
             surfaces[name] = face
 
-        # --- orientation par élément ---
-        a1, a2 = mesh["axis1"], mesh["axis2"]
-        f.write("*DISTRIBUTION TABLE, NAME=ORI_TABLE\n")
-        f.write("COORD3D, COORD3D\n")
-        f.write("*DISTRIBUTION, NAME=ORI_DIST, LOCATION=ELEMENT, TABLE=ORI_TABLE\n")
-        f.write(", 1., 0., 0., 0., 1., 0.\n")
-        for k in range(n_el):
-            u, v = a1[k], a2[k]
-            f.write(f"{k + 1}, {u[0]:.7g}, {u[1]:.7g}, {u[2]:.7g}, {v[0]:.7g}, {v[1]:.7g}, {v[2]:.7g}\n")
-        f.write("*ORIENTATION, NAME=ORI_ELEM, DEFINITION=COORDINATES, SYSTEM=RECTANGULAR\n")
-        f.write("ORI_DIST\n")
-        f.write("3, 0.\n")
-
-        # --- sections : une par zone d'épaisseur ---
-        for z in used:
-            f.write(f"*SHELL SECTION, ELSET={zone_names[z]}, MATERIAL=TBD, ORIENTATION=ORI_ELEM, "
-                    f"STACK DIRECTION=3\n")
-            f.write(f"{zone_t[z]:.6g}, 5\n")
+        # --- section unique : épaisseur constante (moyenne des éléments) ---
+        # Orientation par élément retirée (blocs *DISTRIBUTION / *ORIENTATION invalides
+        # dans *PART) ; réintroduire depuis le CSV _orientation.csv si besoin plus tard.
+        t_section = float(np.mean(thick)) if len(thick) else 0.0
+        f.write(f"** épaisseur de section constante ~{t_section:.4g} mm (moyenne du maillage)\n")
+        f.write("*SHELL SECTION, ELSET=ES_ALL, MATERIAL=TBD, STACK DIRECTION=3\n")
+        f.write(f"{t_section:.6g}, 5\n")
         f.write("*END PART\n")
     Path(path).write_text(to_ascii(f.getvalue()), encoding="ascii")
     names = [zone_names.get(z, "") for z in range(max(used) + 1)] if used else []
-    return dict(zones={zone_names[z]: zone_t[z] for z in used}, elsets=elsets, nsets=nsets,
+    return dict(zones={"ES_ALL": t_section}, elsets=elsets, nsets=nsets,
                 zone_of=zone_of, zone_names=names, surfaces=surfaces,
                 skin_areas=dict(S1=a_ref, S2=a_opp, rel_diff=rel,
                                 inner_outer_significant=bool(rel >= 0.005)))
 
 
-def write_inp_tet(path: Path, mesh: dict, pa, metrics: dict, status: str) -> dict:
+def write_inp_tet(path: Path, mesh: dict, pa, metrics: dict, status: str,
+                  part_name_override: str | None = None) -> dict:
     """Export tétraédrique : C3D10 (ou C3D4), une *SOLID SECTION, pas de matériau."""
     X, C = mesh["nodes"], mesh["conn"]
     etype = "C3D10" if C.shape[1] == 10 else "C3D4"
@@ -204,7 +200,7 @@ def write_inp_tet(path: Path, mesh: dict, pa, metrics: dict, status: str) -> dic
     f.write(f"** repli tetraedrique : {len(C)} {etype}, taille {metrics.get('size', 0):.4g} mm\n")
     f.write(f"** nature detectee : {pa.kind}\n")
     f.write("** MATERIAL=TBD : bloc materiau a fournir\n")
-    f.write(f"*PART, NAME={part_name(pa.source)}\n")
+    f.write(f"*PART, NAME={part_name_override or part_name(pa.source)}\n")
     f.write("*NODE, NSET=NALL\n")
     for i, p in enumerate(X, 1):
         f.write(f"{i}, {p[0]:.9g}, {p[1]:.9g}, {p[2]:.9g}\n")

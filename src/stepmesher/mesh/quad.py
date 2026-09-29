@@ -132,7 +132,9 @@ def _bend_sides(f: int):
     return sides, lens, corners
 
 
-def structured_bends(pa, recipe, h0: float, size_factor: float = 1.0, fixed: dict | None = None) -> list[int]:
+def structured_bends(pa, recipe, h0: float, size_factor: float = 1.0, fixed: dict | None = None,
+                     max_bend_angle_deg: float = 15.0, min_bend_size_frac: float = 0.0,
+                     angle_floor: bool = False) -> list[int]:
     """Plis maillés en transfini : n_per_bend éléments sur l'arc, alignés sur le pli.
 
     Accepte les faces à 4 côtés et celles dont les arcs sont découpés en plusieurs
@@ -141,6 +143,10 @@ def structured_bends(pa, recipe, h0: float, size_factor: float = 1.0, fixed: dic
     done = []
     fixed = {} if fixed is None else fixed
     free = set(getattr(recipe, "free_faces", ()) or ())
+    n_ref_faces: dict[int, int] = {}
+    for g in pa.ref_faces:
+        for c in pa.face_curves.get(g, []):
+            n_ref_faces[abs(c)] = n_ref_faces.get(abs(c), 0) + 1
     # passe 1 : côtés et nombre d'éléments sur l'arc de chaque face de pli
     plans = []
     for b in pa.bends:
@@ -159,11 +165,29 @@ def structured_bends(pa, recipe, h0: float, size_factor: float = 1.0, fixed: dic
             # les arcs doivent être nettement plus courts que les génératrices
             if arc_len > 0.8 * gen_len and arc_len > 2 * h0:
                 continue
-            # au moins n_per_bend éléments, et au plus ~15° d'arc par élément
+            # au moins n_per_bend éléments, et au plus max_bend_angle_deg par élément
             face_angle = np.degrees(arc_len / max(b["radius"], 1e-9))
-            n_arc = _even(int(round(max(recipe.n_per_bend, np.ceil(face_angle / 15.0)) / size_factor)))
+            n_ang = int(np.ceil(face_angle / max(max_bend_angle_deg, 1e-6) - 1e-6))
+            n_arc = max(1, int(round(max(recipe.n_per_bend, n_ang) / size_factor)))
             n_arc = max(n_arc, len(sides[1]), len(sides[3]))
-            n_arc += n_arc % 2
+            # parité imposée seulement si un arc borde une autre face de la peau
+            # (contour maillé librement : nombre de segments pair pour des quads purs) ;
+            # sur un bord libre (arc posé sur un chant), 3 éléments sur 90° sont permis
+            shared = any(n_ref_faces.get(c, 0) > 1 for c in sides[1] + sides[3])
+            if shared:
+                n_arc += n_arc % 2
+            if min_bend_size_frac > 0:
+                # ne pas descendre sous min_bend_size_frac * h0, même si l'arc est petit
+                # (sinon un pli à petit rayon impose une bande d'éléments minuscules sur
+                # toute sa longueur dans une pièce par ailleurs grossière) : le plafond
+                # est arrondi au pair INFÉRIEUR, sinon la parité l'annule silencieusement
+                floor = max(len(sides[1]), len(sides[3]), 2 if shared else 1)
+                # règle de Fred : jamais moins d'1 élément par max_bend_angle_deg (3 sur 90°)
+                if angle_floor:
+                    floor = max(floor, n_ang + (n_ang % 2 if shared else 0))
+                cap = max(floor, int(arc_len / (min_bend_size_frac * h0 * size_factor)))
+                cap = max(floor, cap - cap % 2 if shared else cap)
+                n_arc = min(n_arc, cap)
             plans.append((f, sides, lens, corners, arc_len, n_arc))
     if not plans:
         return done
@@ -195,7 +219,7 @@ def structured_bends(pa, recipe, h0: float, size_factor: float = 1.0, fixed: dic
     return done
 
 
-def merge_micro_curves(max_len: float, protect: set[int] = frozenset()) -> int:
+def merge_micro_curves(max_len: float, protect: set[int] = frozenset()) -> list[list[int]]:
     """Fusionne chaque micro-courbe (< max_len) avec une courbe voisine bordant les
     mêmes faces, en courbe composite : le sommet commun n'impose plus de nœud.
     Seuls les sommets reliant exactement deux courbes sont supprimables."""
@@ -224,14 +248,14 @@ def merge_micro_curves(max_len: float, protect: set[int] = frozenset()) -> int:
         if best is not None:
             groups.append([c, best])
             used.update((c, best))
-    n = 0
+    done = []
     for g in groups:
         try:
             gmsh.model.mesh.setCompound(1, g)
-            n += 1
+            done.append(g)
         except Exception:  # noqa: BLE001
             pass
-    return n
+    return done
 
 
 def _corner_angles(loop, ends) -> list[float]:
@@ -323,7 +347,115 @@ def structured_patches(pa, h0: float, fixed: dict, exclude: set[int], size_facto
     return done
 
 
-def apply_strategy(pa, recipe, h0: float, patches_on: bool = True) -> dict:
+def structured_strips(pa, recipe, h0: float, fixed: dict, exclude: set[int], size_factor: float = 1.0,
+                      max_width_factor: float = 4.0, min_length_ratio: float = 3.0,
+                      min_size_frac: float = 0.35) -> list[int]:
+    """Lanières (faces longues et étroites : largeur <= max_width_factor x h0, longueur >=
+    min_length_ratio x largeur) maillées en rangées régulières (transfini). En maillage
+    libre full-quad, chaque triangle orphelin y devient une « étoile » de 3 petits quads.
+
+    Bouts découpés en plusieurs courbes : autant de rangées que de courbes au bout le plus
+    découpé, tant que la rangée reste >= min_size_frac x h0 ; sinon la face reste libre.
+    Parité : un côté partagé avec une autre face de peau porte un nombre pair de segments
+    (contour des faces libres voisines en full-quad)."""
+    free = set(getattr(recipe, "free_faces", ()) or ())
+    h = h0 * size_factor
+    nref: dict[int, int] = {}
+    for g in pa.ref_faces:
+        for c in pa.face_curves.get(g, []):
+            nref[abs(c)] = nref.get(abs(c), 0) + 1
+
+    def shared(cs):
+        return any(nref.get(c, 0) > 1 for c in cs)
+
+    done = []
+    for f in pa.ref_faces:
+        if f in exclude or f in free:
+            continue
+        try:
+            r = _bend_sides(f)
+        except Exception:  # noqa: BLE001
+            r = None
+        if r is None:
+            continue
+        sides, lens, corners = r
+        L = (lens[0][0], lens[2][0])
+        if max(L) > 1.5 * min(L):
+            continue
+        Lm = float(np.mean(L))
+        w = gmsh.model.occ.getMass(2, f) / Lm
+        if w > max_width_factor * h or Lm < min_length_ratio * w:
+            continue
+        # bouts ~droits en travers : un bout long et découpé (redans, coin arrondi
+        # prolongé) tord le transfini (éléments retournés, part_021 face 59)
+        if max(sum(lens[1]), sum(lens[3])) > 1.5 * w:
+            continue
+        # rangées en travers
+        n_w = max(1, int(round(w / h)), len(sides[1]), len(sides[3]))
+        if w / n_w < min_size_frac * h:
+            continue
+        ends_shared = shared(sides[1]) or shared(sides[3])
+        if ends_shared:
+            if len(sides[1]) > 1 and shared(sides[1]) or len(sides[3]) > 1 and shared(sides[3]):
+                continue
+            n_w += n_w % 2
+        # segments le long : imposés par un voisin déjà structuré (pli), sinon h
+        fixed_l = {fixed[sides[sd][0]] - 1 for sd in (0, 2) if sides[sd][0] in fixed}
+        if len(fixed_l) > 1:
+            continue
+        if fixed_l:
+            n_l = fixed_l.pop()
+        else:
+            n_l = max(1, int(round(Lm / h)))
+            if shared(sides[0]) or shared(sides[2]):
+                n_l += n_l % 2
+        want = {sides[0][0]: n_l + 1, sides[2][0]: n_l + 1}
+        for sd in (1, 3):
+            for c, k in zip(sides[sd], _split_count(lens[sd], n_w)):
+                want[c] = k + 1
+        if any(c in fixed and fixed[c] != n for c, n in want.items()):
+            continue
+        try:
+            for c, n in want.items():
+                gmsh.model.mesh.setTransfiniteCurve(c, n)
+            gmsh.model.mesh.setTransfiniteSurface(f, cornerTags=corners)
+            gmsh.model.mesh.setRecombine(2, f)
+        except Exception:  # noqa: BLE001
+            continue
+        fixed.update(want)
+        done.append(f)
+    return done
+
+
+def even_boundaries(pa, structured: set[int], skip_curves: set[int] = frozenset()) -> int:
+    """Recombinaison full-quad : gmsh divise par deux le maillage 1D de chaque courbe d'une
+    face libre ; une courbe à nombre IMPAIR de segments (typiquement une arête CAD courte à
+    1 segment) fait échouer la face (« 1D mesh cannot be divided by 2 »). Maille en 1D puis
+    ajoute un segment à ces courbes (hors transfinis imposés ; composites comprises : gmsh
+    y garde le nœud commun, la parité porte sur chaque constituant). Remplace
+    l'ancien raffinement autour des arêtes courtes, qui ne servait qu'à ça et produisait
+    des anneaux d'éléments minuscules. Renvoie le nombre de courbes corrigées."""
+    free_faces = [f for f in pa.ref_faces if f not in structured]
+    struct_curves = {abs(c) for f in structured for _, c in gmsh.model.getBoundary([(2, f)], oriented=False)}
+    curves = {abs(c) for f in free_faces for _, c in gmsh.model.getBoundary([(2, f)], oriented=False)}
+    gmsh.model.mesh.generate(1)
+    n_fix = 0
+    for c in sorted(curves - struct_curves - set(skip_curves)):
+        try:
+            n = sum(len(t) for t in gmsh.model.mesh.getElements(1, c)[1])
+        except Exception:  # noqa: BLE001
+            continue
+        if n % 2:
+            gmsh.model.mesh.setTransfiniteCurve(c, n + 2)
+            n_fix += 1
+    if n_fix:
+        gmsh.model.mesh.clear()
+    return n_fix
+
+
+def apply_strategy(pa, recipe, h0: float, patches_on: bool = True,
+                   max_bend_angle_deg: float = 15.0, min_bend_size_frac: float = 0.0,
+                   bend_angle_floor: bool = False) -> dict:
     s = recipe.strategy
     gmsh.option.setNumber("Mesh.RecombineAll", 1)
     gmsh.option.setNumber("Mesh.Smoothing", 5)
@@ -332,18 +464,33 @@ def apply_strategy(pa, recipe, h0: float, patches_on: bool = True) -> dict:
     sf = 2.0 if s == "subdiv" else 1.0
     fixed: dict[int, int] = {}
     structured = getattr(recipe, "structured", True)
-    bends = structured_bends(pa, recipe, h0, sf, fixed) if structured and s in ("conform", "compound", "blossom", "subdiv") else []
+    bends = structured_bends(pa, recipe, h0, sf, fixed, max_bend_angle_deg, min_bend_size_frac,
+                             bend_angle_floor) \
+        if structured and s in ("conform", "compound", "blossom", "subdiv") else []
     info["structured_bends"] = len(bends)
+    strips = []
+    if structured and s in ("conform", "compound", "blossom", "subdiv") and getattr(recipe, "strips", True):
+        strips = structured_strips(pa, recipe, h0, fixed, set(bends), sf)
+    info["structured_strips"] = strips
+    bends = bends + strips
     info["structured_list"] = list(bends)
     if structured and s in ("conform", "compound", "blossom"):
         # toutes les faces à 4 côtés si demandé, sinon seulement les petites
         patches = structured_patches(pa, h0, fixed, set(bends), sf,
                                      max_side=float("inf") if patches_on else 3.0 * h0)
         info["structured_patches"] = len(patches)
+        info["structured_patch_list"] = list(patches)
         bends = bends + patches
     if s != "qqs":
         fixed_c = {abs(c) for f in bends for _, c in gmsh.model.getBoundary([(2, f)], oriented=False)}
-        info["micro_curve_merges"] = merge_micro_curves(min(0.1 * h0, 0.25 * pa.classification["t_median"]), fixed_c)
+        # points/arêtes CAD trop proches (rayon isolé, jonction serrée...) : fusionnés en
+        # courbe composite avant maillage, sinon un point CAD isolé impose un nœud et un
+        # éventail d'éléments minuscules autour, même si le champ de taille est grossier
+        merge_frac = min_bend_size_frac if min_bend_size_frac > 0 else 0.1
+        merge_len = min(merge_frac * h0, 0.5 * pa.classification["t_median"])
+        merged = merge_micro_curves(merge_len, fixed_c)
+        info["micro_curve_merges"] = len(merged)
+        info["merged_curves"] = sorted(c for g in merged for c in g)
     periodic = [f for f in pa.ref_faces if _is_periodic(f) and f not in bends]
     if s in ("conform", "blossom"):
         gmsh.option.setNumber("Mesh.Algorithm", 8)

@@ -202,7 +202,7 @@ def prepare_part(step_path: str | Path, workdir: str | Path, cfg, reference_skin
     st, sk, tt, t_max = _analyze_current(cfg)
     timings.update({f"{k}_1": v for k, v in tt.items()})
     P_obb_w = st.area
-    _, axes, dims = obb(st.centroid, P_obb_w)
+    obb_center, axes, dims = obb(st.centroid, P_obb_w)
     diag = float(np.linalg.norm(dims))
 
     # --- trous : bouchage des petits trous ---
@@ -242,10 +242,12 @@ def prepare_part(step_path: str | Path, workdir: str | Path, cfg, reference_skin
         holes_kept = [h for h in holes_now if h["is_hole"]]
     # sinon : mêmes faces, mêmes tags -> l'analyse n°1 reste valable telle quelle
 
-    cls = C.classify(sk, cfg)
+    cls = C.classify(sk, cfg, st=st, obb_center=obb_center, obb_axes=axes, obb_dims=dims)
     kind = cls["kind"]
     mode = reference_skin or cfg["mesh"]["reference_skin"]
-    ref, why = C.choose_reference_side(st, sk, kind, mode)
+    # choix de la peau : basé sur la classification d'épaisseur (constant/variable/massive),
+    # pas sur le type "profile" (balayage) qui ne change pas ce choix pour l'instant
+    ref, why = C.choose_reference_side(st, sk, cls.get("thickness_kind", kind), mode)
     ref_faces = sorted(f for f, s in sk.side_of_face.items() if s == ref)
     opp_faces = sorted(f for f, s in sk.side_of_face.items() if s != ref)
     ref_tri = np.isin(st.face, ref_faces) & sk.tri_anti & np.isfinite(sk.tri_t)

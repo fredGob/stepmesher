@@ -3,12 +3,22 @@
 # passer `--config ma_config.toml`. Seules les clés présentes surchargent les défauts.
 # Toutes les longueurs sont en mm.
 
+[family]
+# Famille de pièce (vocabulaire de Fred ; stabilo = clip pour le maillage). Rapport + summary.csv ;
+# `tet_direct` : familles maillées directement en tétra. Règles dans l'ordre, calées sur 44 pièces :
+tet_direct = ["fitting", "clip_autre"]  # pièces usinées : jamais de SC8R (décision de Fred)
+frame_min_length_mm = 1500.0    # 1) longueur OBB >= : frame (010, 036)
+fitting_max_length_mm = 400.0   # 2) usinée (épaisseur variable) : fitting si longueur <, sinon clip_autre
+peau_max_height_t = 5.0         # 3) sans pli et hauteur OBB <= k x épaisseur : peau
+intercostale_min_length_mm = 450.0  # 4) longueur >= et >= 2 plis : intercostale ; sinon clip
+min_bend_deg = 30.0             # plis comptés à partir de cet angle
+
 [general]
 occ_target_unit = "MM"          # conversion d'unités à l'import STEP
 attempt_timeout_s = 300         # délai max d'un essai de maillage (sous-processus)
 part_time_budget_s = 900        # budget de temps total par pièce
 max_attempts = 8                # nombre max d'essais de maillage par pièce
-threads = 2                     # threads gmsh
+threads = 1                     # threads gmsh (> 1 : non déterministe, fausse la non-régression)
 
 [healing]
 enabled = true
@@ -24,6 +34,15 @@ occ_wireframe = true            # nettoyage OCP systématique (ShapeFix_Wirefram
                                 # effondre les micro-arêtes en préservant le solide (kernel OCP requis)
 occ_wireframe_precision_mm = 0.05      # arêtes plus courtes effondrées (aligné sur quality.min_absolute_edge_mm)
 occ_wireframe_max_volume_change = 5e-3  # au-delà, le nettoyage OCP est rejeté (géométrie brute conservée)
+occ_chant_fillet_max_arc_mm = 3.0    # micro-congés de CHANT (cylindre de hauteur ~ épaisseur) d'arc plus
+                                    # court supprimés (BRepAlgoAPI_Defeaturing) : sinon amas d'éléments
+                                    # minuscules au coin du contour (part_025). 0 = désactivé
+occ_wireframe_precision_mm_deep = 0.6   # 2e passe de nettoyage, plus agressive (sommets isolés proches,
+                                # ex. courtes arêtes entre 2 faces sans arête voisine à fusionner) :
+                                # tentée SEULEMENT si la variante normale n'est pas déjà parfaite, mise
+                                # en course avec les autres géométries (brute/nettoyée) via le score
+                                # habituel -> si elle dégrade la reconnaissance des peaux ailleurs sur
+                                # la pièce, elle perd la course et n'est jamais retenue. 0 = désactivée.
 
 [analysis]
 sample_size_frac = 0.01         # taille de la triangulation d'analyse (fraction de diagonale)
@@ -35,6 +54,13 @@ skin_ratio = 0.6                # patch = peau si épaisseur < skin_ratio * larg
 constant_thickness_rel_tol = 0.08  # dispersion d'épaisseur tolérée pour une tôle constante
 sharp_edge_angle_deg = 20.0     # au-delà, arête vive entre deux faces de peau
 bend_min_angle_deg = 10.0       # angle mini pour compter une face comme pli
+profile_elongation_min = 2.5    # dims[0]/dims[1] (OBB) au-delà duquel une pièce est jugée
+                                # assez allongée pour être un profilé/lisse (T/Z/L/oméga) balayé
+profile_section_rel_tol = 0.25  # dispersion tolérée du périmètre de section le long de l'axe
+                                # (les renforts locaux type "pad-up" élargissent la section par
+                                # endroits ; seuil calé sur des pièces réelles, à ajuster)
+profile_n_stations = 12         # nombre de coupes le long de l'axe long pour comparer la section
+profile_margin_frac = 0.15      # marge ignorée à chaque extrémité (effets de bord, congés de fin)
 
 [holes]
 fill = true                     # bouchage automatique des petits trous
@@ -43,24 +69,46 @@ max_diameter_frac = 0.02        # seuil relatif à la diagonale (0 = ignoré)
                                 # seuil effectif = min des seuils non nuls
 
 [mesh]
-size_frac = 0.01                # taille cible = size_frac * diagonale OBB ...
+nominal_size_mm = 10.0          # taille cible = nominal * min(1, (diag / ref_diag)^exposant) (règle de Fred :
+nominal_ref_diag_mm = 600.0     # 10 mm grandes pièces, ~8 mm petites : 130 mm -> 7,9 ; 300 -> 9,0)
+nominal_size_exponent = 0.15    # 0 = taille nominale partout ; nominal_size_mm = 0 -> ancienne règle size_frac
+size_frac = 0.01                # (si nominal_size_mm = 0) taille cible = size_frac * diagonale OBB ...
 thickness_factor = 10.0         # ... plafonnée à thickness_factor * épaisseur ...
 min_size_mm = 0.5               # ... et bornée à [min_size_mm, max_size_mm]
 max_size_mm = 50.0
 micro_edge_ratio = 0.2          # arête < ratio x min_size_mm : imposée par une micro-arête CAD
                                 # (nœud glissé le long du bord ; exemptée des seuils de forme)
-n_per_bend = 4                  # éléments min sur l'arc d'un pli
+n_per_bend = 2                  # éléments min sur l'arc d'un pli
+max_bend_angle_deg = 30.0       # angle max représenté par un élément dans l'arc d'un pli
+                                # (30 -> 3 éléments sur 90°, demande de Fred ; nombre impair
+                                # permis quand l'arc est sur un bord libre)
+min_bend_size_frac = 0.35       # taille mini au pli = min_bend_size_frac * h0 (même si le rayon est
+                                # petit) : évite une bande d'éléments minuscules sur toute la longueur
+                                # d'un pli à petit rayon dans une pièce par ailleurs grossière
+bend_angle_floor = true         # ce plancher ne descend jamais sous 1 élément par max_bend_angle_deg
+                                # (3 éléments dans un rayon à 90°, règle de Fred)
 structured_patches = false      # true : TOUTES les faces à 4 côtés régulières en transfini
                                 # (false : seulement les petites, côté <= 3 x taille)
-curvature_n = 24                # éléments par tour complet sur les surfaces courbes (0 = off)
+curvature_n = 3                 # éléments par tour complet sur les surfaces courbes (0 = off) ;
+                                # 3 (choix de Fred) : pas de sur-raffinement isotrope des congés
 n_per_hole = 12                 # éléments min sur le périmètre d'un trou conservé
+short_curve_min_size_frac = 0.0 # plancher du raffinement autour des arêtes CAD courtes (x h0)
+short_curve_dist_frac = 4.0     # portée de ce raffinement (x h0) ; 1,5-2,5 testés (sept. 2026) : 004/014
+                                # échouent en élancement près des micro-arêtes -> recette MeshAdapt, pire
 tangent_angle_deg = 10.0        # fusion en surfaces composites sous cet angle
 reference_skin = "inner"        # inner | outer
-size_variants = [1.0, 0.7]      # multiplicateurs de taille essayés pour chaque stratégie
+size_variants = [1.0, 0.7, 0.5]      # multiplicateurs de taille essayés pour chaque stratégie
 local_repair = true             # bascule d'arête + lissage local des quads médiocres
 repair_threshold = 0.2          # quads visés : jacobien 2D sous ce seuil
 adaptive_attempts = 8           # essais adaptatifs (remaillage local des faces fautives)
+skip_sc8r_below = 0.0           # si > 0 : score de faisabilité SC8R (analyze/feasibility) sous
+                                # ce seuil -> repli tétra direct sans épuiser les essais SC8R.
+                                # 0 = jamais (avis de faisabilité seulement journalisé/summary).
+                                # A calibrer sur une campagne avant d'activer (0.35-0.45 typique).
 strategies = ["conform", "subdiv"]
+t_junction_stop_after = 2       # N essais SC8R maillés TOUS en plusieurs morceaux disjoints : topologie
+                                # des peaux en T (ferrure, profilé en T) -> arrêt des essais SC8R, tétra
+                                # (0 = off)
                                 # disponibles aussi : "compound" (fusion des faces tangentes :
                                 # plante ou dépasse le délai sur les pièces CATIA testées),
                                 # "blossom" (peut laisser des triangles,
@@ -70,13 +118,21 @@ strategies = ["conform", "subdiv"]
 # Repli tétraédrique : pièce massive, ou toutes les recettes SC8R en échec.
 enabled = true
 order = 2                       # 2 = C3D10 (défaut), 1 = C3D4
-size_frac = 0.01                # taille = size_frac * diagonale ...
-thickness_factor = 1.0          # ... plafonnée à k * épaisseur médiane (~2 C3D10 dans l'épaisseur)
-min_size_mm = 0.5
+size_frac = 0.05                # taille = size_frac * diagonale ...
+thickness_factor = 2.0          # ... plafonnée à k * épaisseur médiane (1 C3D10 dans l'épaisseur : ferrure
+                                # 165 mm, t = 4 -> 8 mm ; 1.0 donnait 16 900 C3D10, trop fin pour Fred)
+min_size_mm = 1.0
 max_size_mm = 20.0
-curvature_n = 8                 # raffinement sur les surfaces courbes (éléments par tour)
+curvature_n = 3                 # raffinement sur les surfaces courbes (éléments par tour)
 min_size_ratio = 0.25           # taille min = ratio x taille cible
+short_curve_frac = 0.5          # raffinement local (~longueur de la courbe) autour des courbes < frac x taille
+                                # (noeuds de congés : tétras écrasés sinon, part_020) ; 0 = off
+retry_size_mults = [0.7, 0.5]   # si aucun essai ne passe : au plus 2 réductions de taille (meilleure source)
 min_shape_quality = 0.05        # rayon inscrit normalisé (1 = tétra régulier)
+min_shape_quality_t = 0.03      # idem pour les pièces en T (SC8R en morceaux disjoints) : décision de Fred
+fillet_bands = true             # congés (cylindres à 4 côtés) maillés en bande régulière transfinie
+fillet_max_angle_deg = 30.0     # 1 élément par 30° en travers du congé (3 sur 90°)
+fillet_min_size_frac = 0.35     # taille en travers >= ratio x taille cible (sinon moins d'éléments)
 
 [quality]
 # Deux niveaux :
@@ -95,19 +151,12 @@ max_aspect_ratio = 10.0         # CIBLE : quad dans le plan (arête max / arête
 min_angle_deg = 20.0            # CIBLE
 max_angle_deg = 160.0           # CIBLE
 max_warp_deg = 20.0             # CIBLE
-soft_violation_pct = 0.2        # % max d'éléments hors cibles
+regularity_jump_max = 1.5       # RÉGULARITÉ (non bloquant, départage les recettes qui passent) :
+                                # rapport de tailles max entre quads voisins (règle de Fred)
+regularity_small_frac = 0.5     # ... et quads « trop petits » : < frac x taille nominale (hors plis)
+soft_violation_pct = 0.2        # % max d'éléments hors cibles (tôle constante)
+soft_violation_min_count = 5    # ... mais toujours au moins ce nombre d'éléments toléré (petits maillages)
+soft_violation_pct_variable = 1.0  # idem pour les pièces à épaisseur VARIABLE (rampes) : la
+                                # transition d'épaisseur lissée produit quelques éléments en biais
+                                # inévitables ; tolérance plus large (critères DURS jamais relâchés)
 
-[llm]
-# Conseiller LLM local (llama-server), optionnel et jamais bloquant : il choisit le
-# prochain essai quand une recette échoue. Toute panne (serveur absent, délai, JSON
-# invalide, action inconnue) fait repartir sur les règles déterministes.
-#   llama-server -m qwen3-4b-instruct-q4_k_m.gguf -c 8192 -ngl 99 -fa --port 8080
-enabled = false
-base_url = "http://127.0.0.1:8080"
-model = "local"                 # nom transmis à l'API (ignoré par llama-server)
-timeout_s = 60.0
-temperature = 0.2
-max_tokens = 256                # sortie : une décision JSON, ~50-150 tokens
-max_attempts_history = 10       # essais transmis (les plus récents) ; borne la taille du prompt
-max_faces = 12                  # faces fautives listées par essai
-min_attempts_before = 1         # nb d'essais échoués avant de solliciter le LLM

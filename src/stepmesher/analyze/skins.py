@@ -212,7 +212,13 @@ def analyze_skins(st: SurfTri, cfg, t_max: float) -> SkinAnalysis:
                        thickness=float(d), coverage=cov, opposite=opp)
 
     # 1) critère local : épaisseur petite devant la largeur propre de la face
-    skin = {f for f, v in info.items() if v["coverage"] >= 0.5 and v["thickness"] < a["skin_ratio"] * v["width"]}
+    #    et pas franchement plus mince que sa face opposée : un chant arrondi
+    #    (congé R ~ t/2) voit la peau voisine de biais, à faible distance.
+    def not_oblique(v):
+        o = info.get(v["opposite"])
+        return o is None or not np.isfinite(o["thickness"]) or v["thickness"] >= o["thickness"] / 3
+    skin = {f for f, v in info.items() if v["coverage"] >= 0.5 and v["thickness"] < a["skin_ratio"] * v["width"]
+            and not_oblique(v)}
 
     # 2) propagation : faces tangentes à une peau, d'épaisseur cohérente (plis,
     #    lanières CATIA étroites). Les congés d'arête peau/chant ont une
@@ -248,8 +254,12 @@ def analyze_skins(st: SurfTri, cfg, t_max: float) -> SkinAnalysis:
     patches = [dict(id=fidx[f], faces=[f], skin=f in skin_faces, **info[f]) for f in faces]
 
     # --- côtés : composantes de faces de peau, 2-coloration par la relation "opposé" ---
+    #     un même côté ne se prolonge que par raccord tangent (sinon un chant
+    #     classé peau par erreur relie les deux côtés en une seule composante)
     nb = st.neighbors()
-    skin_nb = {f: [g for g in nb.get(f, ()) if g in skin_faces] for f in skin_faces}
+    skin_nb = {f: [g for g in nb.get(f, ()) if g in skin_faces
+                   and st.adjacency[(min(f, g), max(f, g))]["angle_deg"] < a["patch_angle_deg"]]
+               for f in skin_faces}
     comp_of, comps = _components(sorted(skin_faces), skin_nb)
     face_area = st.face_area()
     comp_area = [sum(face_area.get(f, 0) for f in c) for c in comps]

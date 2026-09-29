@@ -175,7 +175,7 @@ def offset_nodes(pa, qm: QuadMesh, edge_nodes: np.ndarray | None = None) -> Offs
     t_ray, j = cast_rays(target.st, qm.X, d, t_max, exit_cos=np.cos(np.radians(75.0)))
     hit = j >= 0
     face_hit = np.where(hit, target.st.face[np.maximum(j, 0)], -1)
-    if pa.kind == "constant":
+    if pa.classification.get("thickness_kind", pa.kind) == "constant":
         # Une face de chant peut être une sortie valide du rayon mais pas la peau
         # opposée. Pour une tôle constante, un impact à mi-épaisseur est suspect :
         # chercher alors la peau opposée seule avant de construire le SC8R.

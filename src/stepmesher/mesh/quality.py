@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 from .hexa import SolidShellMesh
 from .offset import OffsetResult
@@ -81,6 +83,23 @@ def quad_metrics(X: np.ndarray, Q: np.ndarray):
     return aspect, angs.min(1), angs.max(1), warp
 
 
+def mesh_pieces(n_nodes: int, *conns) -> int:
+    """Nombre de morceaux disjoints (éléments reliés par au moins un nœud commun)."""
+    conns = [np.asarray(c) for c in conns if len(c)]
+    if not conns:
+        return 0
+    rows = np.concatenate([np.repeat(np.arange(len(c)) + sum(len(d) for d in conns[:i]), c.shape[1])
+                           for i, c in enumerate(conns)])
+    cols = np.concatenate([c.ravel() for c in conns])
+    n_el = sum(len(c) for c in conns)
+    A = coo_matrix((np.ones(len(rows)), (rows, cols + n_el)), shape=(n_el + n_nodes,) * 2)
+    used = np.zeros(n_el + n_nodes, bool)
+    used[:n_el] = True
+    used[cols + n_el] = True
+    _, lab = connected_components(A, directed=False)
+    return int(len(np.unique(lab[used])))
+
+
 def _stats(x):
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
@@ -139,6 +158,10 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
         reasons.append("aucun élément")
     if m["n_negative_jacobian"]:
         reasons.append(f"{m['n_negative_jacobian']} élément(s) retourné(s) (jacobien <= 0)")
+    # une pièce = un seul morceau de maillage (peau de référence coupée par un chant, etc.)
+    m["n_pieces"] = mesh_pieces(len(X), sm.hexa, sm.wedge)
+    if m["n_pieces"] > 1:
+        reasons.append(f"maillage en {m['n_pieces']} morceaux disjoints (critère dur)")
     # plancher absolu de taille : jamais exempté, même pour une arête « imposée par la CAD »
     # (sinon un défaut STEP non nettoyé produit des éléments dégénérés qui passent quand même)
     min_edge_mm = q.get("min_absolute_edge_mm", 0.0)
@@ -173,15 +196,56 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
     soft_all = soft | (imposed & (sj < q["min_scaled_jacobian"]))
     n_soft = int(soft.sum())
     pct = 100.0 * n_soft / max(n_el, 1)
-    m["soft_violations"] = dict(count=n_soft, pct=pct, by_criterion=detail,
-                                elements=(np.nonzero(soft)[0] + 1).tolist()[:500])
-    if pct > q["soft_violation_pct"] + 1e-12:
-        reasons.append(f"{n_soft} élément(s) hors cibles ({pct:.2f} % > {q['soft_violation_pct']} %) : {detail}")
+    # tôle constante : tolérance stricte ; épaisseur variable (rampes) : tolérance plus
+    # large (la transition lissée impose quelques éléments en biais). Critères durs inchangés.
+    soft_limit = q["soft_violation_pct"]
+    if kind == "variable":
+        soft_limit = q.get("soft_violation_pct_variable", soft_limit)
+    # petits maillages : le % ne tolérerait aucun élément imposé par la CAD
+    min_count = int(q.get("soft_violation_min_count", 0))
+    m["soft_violations"] = dict(count=n_soft, pct=pct, limit_pct=soft_limit, min_count=min_count,
+                                by_criterion=detail, elements=(np.nonzero(soft)[0] + 1).tolist()[:500])
+    if pct > soft_limit + 1e-12 and n_soft > min_count:
+        reasons.append(f"{n_soft} élément(s) hors cibles ({pct:.2f} % > {soft_limit} % et > {min_count}) : {detail}")
     m["passed"] = not reasons
     m["reasons"] = reasons
     # score pour départager des essais tous en échec (le moins mauvais)
     # score (plus grand = meilleur) : pondère les défauts par gravité
     m["n_hard_bad"] = int(hard_bad.sum())
-    m["score"] = float(-(1000 * m["n_negative_jacobian"] + 20 * m["n_hard_bad"] + 100 * tri_pct + 10 * pct)
+    m["score"] = float(-(1000 * m["n_negative_jacobian"] + 1000 * max(0, m.get("n_pieces", 1) - 1) + 20 * m["n_hard_bad"] + 100 * tri_pct + 10 * pct)
                        + (sj.min() if len(sj) else -1))
     return m, soft_all
+
+
+def regularity(sm: SolidShellMesh, h0: float, exempt_faces=frozenset(), jump_max: float = 1.5,
+               small_frac: float = 0.5) -> dict:
+    """Régularité visuelle de la peau de référence (critère « esthétique », non bloquant).
+
+    Taille d'un quad = racine de son aire. Hors faces exemptées (plis transfinis : petits
+    par construction, 3 éléments dans le rayon) :
+    - small_pct : % de quads plus petits que small_frac x h0 (h0 = taille nominale) ;
+    - jump_pct  : % des arêtes partagées entre deux quads dont le rapport de tailles
+      dépasse jump_max (règle de Fred : transitions <= 1,5) ;
+    - penalty   : small_pct + jump_pct, départage les recettes qui passent (plus petit =
+      plus régulier). Le % hors cibles favorisait les maillages fins (défauts dilués)."""
+    Q = sm.hexa[:, :4]
+    if len(Q) == 0 or h0 <= 0:
+        return dict(small_pct=0.0, jump_pct=0.0, jump_p95=1.0, penalty=0.0, n_counted=0)
+    P = sm.nodes[Q]
+    size = np.sqrt(0.5 * np.linalg.norm(np.cross(P[:, 2] - P[:, 0], P[:, 3] - P[:, 1]), axis=1))
+    keep = ~np.isin(sm.hexa_face, np.fromiter(exempt_faces, int, len(exempt_faces)))
+    small_pct = 100.0 * float(np.mean(size[keep] < small_frac * h0)) if keep.any() else 0.0
+    # arêtes partagées entre deux quads comptés
+    e = np.sort(np.stack([Q, np.roll(Q, -1, 1)], 2).reshape(-1, 2), 1)
+    owner = np.repeat(np.arange(len(Q)), 4)
+    order = np.lexsort((e[:, 1], e[:, 0]))
+    e, owner = e[order], owner[order]
+    same = np.all(e[1:] == e[:-1], axis=1)
+    a, b = owner[:-1][same], owner[1:][same]
+    both = keep[a] & keep[b]
+    a, b = a[both], b[both]
+    ratio = np.maximum(size[a], size[b]) / np.maximum(np.minimum(size[a], size[b]), 1e-300)
+    jump_pct = 100.0 * float(np.mean(ratio > jump_max)) if len(ratio) else 0.0
+    return dict(small_pct=small_pct, jump_pct=jump_pct,
+                jump_p95=float(np.percentile(ratio, 95)) if len(ratio) else 1.0,
+                penalty=small_pct + jump_pct, n_counted=int(keep.sum()))

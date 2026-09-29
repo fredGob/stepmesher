@@ -35,6 +35,30 @@ def quad_quality(X: np.ndarray, Q: np.ndarray) -> np.ndarray:
     return out
 
 
+def _quad_shape(X: np.ndarray, Q: np.ndarray):
+    """Élancement (arête max / min), angle interne min et max (deg) par quad.
+
+    Sert à cibler la réparation sur les mêmes critères de forme que le verdict de
+    qualité (angle max, angle min, élancement), pas seulement sur le jacobien.
+    """
+    Q = np.asarray(Q, dtype=np.int64).reshape(-1, 4)
+    if len(Q) == 0:
+        z = np.zeros(0)
+        return z, z, z
+    P = [X[Q[:, k]] for k in range(4)]
+    edges = [P[(k + 1) % 4] - P[k] for k in range(4)]
+    lens = np.stack([np.linalg.norm(e, axis=1) for e in edges], 1)
+    aspect = lens.max(1) / np.maximum(lens.min(1), 1e-300)
+    angs = []
+    for k in range(4):
+        u = -edges[(k - 1) % 4]
+        v = edges[k]
+        c = np.einsum("ij,ij->i", u, v) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(v, axis=1), 1e-300)
+        angs.append(np.degrees(np.arccos(np.clip(c, -1, 1))))
+    angs = np.stack(angs, 1)
+    return aspect, angs.min(1), angs.max(1)
+
+
 def _rot_to_edge(q, u, v):
     """Rotation cyclique de q pour que l'arête u->v soit en positions 2->3."""
     for r in range(4):
@@ -97,13 +121,25 @@ class _Local:
 
 
 def flip_repair(qm: QuadMesh, fixed: np.ndarray, threshold: float = 0.35, passes: int = 4,
-                gain: float = 0.05) -> int:
+                gain: float = 0.05, shape: dict | None = None) -> int:
+    """Bascule + lissage local des quads médiocres.
+
+    `threshold` : jacobien 2D en dessous duquel un quad est visé. `shape` (optionnel,
+    seuils `max_angle_deg` / `min_angle_deg` / `max_aspect_ratio`) vise en plus les
+    quads qui violent les critères de forme cibles même si leur jacobien reste au-dessus
+    du seuil : un quad à 167° a un jacobien ~0.22 > 0.2 et échappait sinon à la réparation.
+    """
     X = qm.X.copy()
     Q = [list(map(int, q)) for q in qm.quads]
     F = qm.quad_face.tolist()
     n_flips = 0
     for _ in range(passes):
         qual = quad_quality(X, np.array(Q, dtype=np.int64))
+        target = qual < threshold
+        if shape:
+            aspect, amin, amax = _quad_shape(X, np.array(Q, dtype=np.int64))
+            target |= ((amax > shape["max_angle_deg"]) | (amin < shape["min_angle_deg"])
+                       | (aspect > shape["max_aspect_ratio"]))
         edge_q = defaultdict(list)
         node_quads = defaultdict(list)
         for i, q in enumerate(Q):
@@ -115,8 +151,8 @@ def flip_repair(qm: QuadMesh, fixed: np.ndarray, threshold: float = 0.35, passes
         touched = set()
         changed = 0
         for i in np.argsort(qual):
-            if qual[i] >= threshold:
-                break
+            if not target[i]:
+                continue
             if i in touched:
                 continue
             q1 = Q[i]
