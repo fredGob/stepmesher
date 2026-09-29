@@ -71,6 +71,32 @@ face de peau, accepté par Fred). Les éléments fins sont dans les faces VOISIN
   courtes) : indicateur relatif, pas un seuil absolu ; (d) **campagne 44 pièces à relancer**
   et comparer à `result_v7` (`compare_runs.py`).
 
+**29/09/2026 (result_v8, part_004)** : le « rayon à 14 éléments » de Fred n'était PAS un pli
+(les 3 plis ont 3-5 rangées) mais un **coin arrondi du contour** (R 5 à 90°, vu dans le plan de
+la tôle) : 12 segments de 0,74 mm, à cause de 2 facettes de chant BSpline de 1,03 x 2,17 mm à ses
+bouts (arêtes de 1 mm sur la peau -> gradation arêtes courtes + parité 2 segments). Pour Fred,
+« rayon » = pli OU coin du contour : même règle 3 él./90°.
+- **Fait** : `quad.contour_arcs` (appelé dans `apply_strategy`, pas en subdiv) impose sur tout arc
+  du contour de peau (courbe peau∩chant, rotation >= 15°, hors trous conservés) n = max(1 él./
+  max_bend_angle_deg, L/h0), pair en full-quad -> **4 sur 90°** (3 impossible : gmsh full-quad
+  exige un nombre pair par courbe). 004 : arc R5 12 -> 4 segments ; 122 tests OK.
+- **Non résolu** : les 2 arêtes de 1 mm restent (2 segments de 0,5 mm aux bouts de l'arc).
+  `BRepAlgoAPI_Defeaturing` d'une facette de chant quelconque (4 arêtes : 2 ~ t, 2 <= 1,5 mm)
+  marche sur 4 facettes sur 6 de part_004 (une par une, validité vérifiée) mais PAS sur les
+  2 du coin (solide invalide, même après ShapeFix_Shape ; ou aucun effet). `setCompound` 1D
+  garde le nœud commun (vérifié). Nettoyage profond à 1,1 mm : accepté (valide, dV/V 8e-4)
+  mais **replie des éléments dans le vide de l'encoche** sans que la qualité le voie -> NE PAS
+  monter `occ_wireframe_precision_mm_deep`. Les contrôles d'arcs sur .vtu par
+  `gmsh getClosestPoint` sur BSpline sont faux (renvoie l'extrémité).
+- **EN COURS (29/09/2026 ~09:08)** : campagne 44 pièces avec `contour_arcs` lancée ->
+  `result_v9/` (journal `result_v9_run.log`, config par défaut). À faire ensuite :
+  `python tools/compare_runs.py result_v8 result_v9`, vérifier statuts, nb d'éléments,
+  small_pct/jump_pct, puis vues zoomées des coins arrondis (004 d'abord). Si la campagne a été
+  coupée : la relancer (même commande, `-o result_v9`). Sauvegarde du code modifié :
+  `~/stepmesher_backup_20260929_contour_arcs.zip`. En attente de Fred : (a) accepter ou non les
+  2 éléments de 0,5 mm aux bouts de l'arc R5 de 004 ; (b) ajouter ou non la suppression OCP des
+  facettes de chant quelconques (4/6 sur 004), à valider sur une campagne.
+
 Piste de travail (à discuter avec Fred avant de coder) :
 1. diagnostic chiffré sur part_004 puis sur toute `result_v7` : par pli (toutes ses faces),
    nombre d'éléments en travers ; taille min / taille voisine (gradient) par face ;
