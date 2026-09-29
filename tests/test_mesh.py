@@ -20,7 +20,9 @@ def test_variable_part_is_flagged_approximate(meshed):
     r = reps["plaque_poches"]
     assert r["status"] == "OK_APPROX"
     assert r["approximate"] is True
-    assert len(r["sections"]) == 2                      # une section par palier (2 et 6 mm)
+    # section unique à épaisseur constante (moyenne du maillage) ; paliers 2 et 6 mm
+    assert list(r["sections"]) == ["ES_ALL"]
+    assert 2.0 <= r["sections"]["ES_ALL"] <= 6.0
 
 
 def test_massive_part_falls_back_to_c3d10(meshed):
@@ -35,6 +37,14 @@ def test_massive_part_falls_back_to_c3d10(meshed):
     mesh = read_mesh(out_dir / "bloc_massif.inp")
     et, conn = next(iter(mesh["elems"].values()))
     assert et == "C3D10" and len(conn) == 10
+
+
+def test_profile_part_tries_sc8r_when_skins_are_identified(meshed):
+    _, reps = meshed
+    r = reps["profile_u"]
+    assert r["status"] == "OK"
+    assert r["recipe"]["strategy"] != "tet"
+    assert "fallback_reason" not in r
 
 
 def test_c3d10_midnodes_abaqus_order(meshed):
@@ -121,10 +131,11 @@ def test_inp_roundtrip(meshed, name):
 
 
 def test_tray_corner_miter(meshed):
-    """Coin trièdre du bac : onglet -> jacobien normalisé minimal ~ 1/sqrt(3), jamais retourné."""
+    """Coin trièdre du bac : onglet -> jacobien normalisé minimal <= 1/sqrt(3) (atteint si les
+    quads du coin sont carrés), au-dessus de la cible, jamais retourné."""
     _, reps = meshed
     sj = reps["bac_angles_vifs"]["metrics"]["scaled_jacobian"]["min"]
-    assert sj == pytest.approx(1 / np.sqrt(3), rel=0.02)
+    assert 0.2 < sj <= 1.02 / np.sqrt(3)
 
 
 def test_outputs_present(meshed):

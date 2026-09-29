@@ -9,7 +9,7 @@ modèle « deux peaux » (pièces massives, nervures, jonctions en T) basculent 
 
 > **État** : les 5 pièces réelles de `stps_test/` sortent avec un maillage valide
 > (voir § 9). Tôle constante : `OK`. Épaisseur variable : `OK_APPROX`. Repli tétra : `OK_TET`.
-> Pas encore faits : mémoire de recettes SQLite, LLM optionnel, zones d'épaisseur alignées
+> Pas encore faits : mémoire de recettes SQLite, zones d'épaisseur alignées
 > sur le maillage (voir § 10).
 
 ---
@@ -47,6 +47,14 @@ stepmesher gen-testdata synth/
 
 # configuration par défaut (à copier puis passer avec --config)
 stepmesher dump-config > ma_config.toml
+
+# assembler les .inp valides d'une campagne dans un modele Abaqus maitre avec includes
+python tools/assemble_inp.py result_echelle -o result_echelle/master_include.inp
+# meme assemblage, mais avec tous les blocs *PART ecrits dans un seul fichier
+python tools/assemble_inp.py result_echelle -o result_echelle/master_flat.inp --flatten
+
+# non-regression : comparer une nouvelle campagne a la reference (§ 7)
+python tools/compare_runs.py result_v7 result_v8
 ```
 
 Options utiles de `mesh` :
@@ -60,9 +68,18 @@ Options utiles de `mesh` :
 | `--strategies conform,subdiv` | ordre des stratégies de maillage quad |
 | `--tet-order 1\|2` | repli tétra en C3D4 ou C3D10 (défaut 2) |
 | `--no-tet` | pas de repli tétra (échec SC8R = `FAILED_QUALITY`) |
-| `--llm` / `--llm-url URL` | conseiller LLM local (§ 7) |
 | `--threads N` | threads gmsh |
 | `--keep-work` | conserve les essais intermédiaires (`out/.work/`) |
+
+Dans `[mesh]`, `max_bend_angle_deg` contrôle le raffinement angulaire des plis structurés.
+La valeur par défaut `15.0` conserve le comportement historique ; `30.0` produit des
+congés plus grossiers, sous réserve des contraintes de nombre pair et de qualité.
+
+Le script `tools/assemble_inp.py` genere un `*INCLUDE` et une instance `*INSTANCE`
+pour chaque `.inp`, ou les blocs `*PART` directement dans le master avec `--flatten`.
+Les fichiers `.FAILED.inp` sont exclus par defaut ; ajouter `--include-failed` pour
+les inclure. Les noms `*PART` dupliques sont copies dans `<master>_includes/` avec
+un nom unique en mode include, sans modifier les fichiers sources.
 
 Code retour : 0 si toutes les pièces sont `OK`, `OK_APPROX` ou `OK_TET`, 1 sinon.
 
@@ -101,6 +118,17 @@ Statuts : `OK` (SC8R, tôle constante), `OK_APPROX` (SC8R, épaisseur variable, 
    Supprimer systématiquement les micro-arêtes à l'import casse certaines faces BSpline
    (face non maillable, surfaces auto-intersectantes pour le tétra) : c'est pourquoi la
    géométrie brute est essayée d'abord.
+   - *nettoyage OCP* (`healing.occ_wireframe`, kernel OpenCASCADE) : effondre les micro-arêtes
+     en préservant le solide. Import **tolérant aux versions** d'OCP. Comme ce nettoyage peut
+     **sur-nettoyer** certaines pièces (arêtes utiles effondrées → hexa écrasés), quand il a
+     réellement modifié la géométrie le SC8R est tenté **sur la géométrie nettoyée ET sur la
+     brute** et le **meilleur résultat** est retenu (pas de double coût sinon).
+
+Après l'analyse, un **avis de faisabilité SC8R** (`analyze/feasibility`) donne un score 0..1
+et un verdict (sc8r / hard / tet), calculés sur les caractéristiques (couverture de peau,
+équilibre des deux peaux, faces en échec), journalisés et repris dans `summary.csv` / le JSON —
+utile pour trier une campagne. Déviation directe vers le tétra seulement si
+`mesh.skip_sc8r_below > 0` (désactivée par défaut, seuils à calibrer sur une vraie campagne).
 3. **Tri des surfaces utiles.** Rayons lancés vers l'intérieur de la matière depuis une
    triangulation grossière (KDTree par classes de taille + Möller-Trumbore vectorisé, aucune
    requête OCC point par point) : épaisseur locale et face opposée de chaque face. Chaque face
@@ -175,8 +203,10 @@ combinaison est isolée (gmsh peut planter sur une surface auto-intersectante).
   normalisé ≥ `hard_min_scaled_jacobian` (0,1), 100 % quads (sauf `allow_wedge_pct`), erreur de
   reprojection ≤ 5 % de l'épaisseur, et pour une tôle constante écart d'épaisseur ≤ 15 %.
 - **Critères cibles** : jacobien ≥ 0,2, élancement ≤ 10, angles entre 20° et 160°,
-  gauchissement ≤ 20°. Au plus `soft_violation_pct` (**0,2 %**) des éléments peuvent être hors
-  cible ; ils sont regroupés dans `ES_QUALITY_WARN` et listés dans le JSON.
+  gauchissement ≤ 20°. Au plus `soft_violation_pct` des éléments peuvent être hors
+  cible : **0,2 %** pour une tôle constante, **1,0 %** (`soft_violation_pct_variable`) pour une
+  pièce à épaisseur variable (les rampes imposent quelques hexa en biais à la transition lissée).
+  Ils sont regroupés dans `ES_QUALITY_WARN` et listés dans le JSON.
   `soft_violation_pct = 0` rend tous les critères stricts.
 
 Pourquoi deux niveaux : sur des pièces CATIA réelles, quelques quads à angle presque plat se
@@ -196,8 +226,11 @@ SC8R :
   signalent que la distinction intérieure/extérieure est peu significative), et les mêmes peaux sous
   les noms `SURF_REF` (faces S1, nœuds 1-4) / `SURF_OPP` (faces S2, nœuds 5-8). Le JSON
   indique quelle face (S1/S2) porte chaque surface et les aires ;
-- orientation par élément : `*DISTRIBUTION` (axes 1 et 2) + `*ORIENTATION` ;
-- une `*SHELL SECTION` par zone : `MATERIAL=TBD`, `ORIENTATION=ORI_ELEM`, `STACK DIRECTION=3`.
+- une seule `*SHELL SECTION` sur `ES_ALL` : `MATERIAL=TBD`, `STACK DIRECTION=3`,
+  épaisseur constante = moyenne des épaisseurs d'éléments du maillage. L'orientation par
+  élément (blocs `*DISTRIBUTION` / `*ORIENTATION`) est retirée pour l'instant — invalide
+  telle quelle dans `*PART` ; les axes 1/2 par élément restent disponibles dans
+  `_orientation.csv` pour la réintroduire plus tard.
 
 Tétra : `*ELEMENT, TYPE=C3D10` (ou C3D4), `NS_SKIN`, `ES_ALL`, `ES_QUALITY_WARN`,
 `*SOLID SECTION, MATERIAL=TBD`.
@@ -205,36 +238,17 @@ Tétra : `*ELEMENT, TYPE=C3D10` (ou C3D4), `NS_SKIN`, `ES_ALL`, `ES_QUALITY_WARN
 **Aucun bloc matériau** : définir `*MATERIAL, NAME=TBD` (ou renommer) avant calcul.
 Fichiers en ASCII pur (pas d'accents) pour Abaqus.
 
-## 7. Conseiller LLM local (optionnel)
-
-Quand une recette échoue, le prochain essai est choisi soit par les règles déterministes
-(§ 4.3), soit par un **LLM local** servi par llama-server. Désactivé par défaut.
+## 7. Non-régression entre campagnes
 
 ```bash
-llama-server -m qwen3-4b-instruct-q4_k_m.gguf -c 8192 -ngl 99 -fa --port 8080
-stepmesher mesh piece.stp -o out/ --llm            # ou --llm-url http://127.0.0.1:8080
+python tools/compare_runs.py result_v7 result_v8 [--tol-el 0.10]
 ```
 
-- **Entrée** : résumé de la pièce (nature, paliers, nombre de faces, plis, trous) et
-  historique des essais (recette, raison de l'échec, faces fautives). Taille bornée par
-  `llm.max_attempts_history` et `llm.max_faces` : mesurée entre 150 et 3 300 tokens sur les
-  pièces d'essai, soit **`-c 8192` largement suffisant**.
-- **Sortie** : un JSON contraint par schéma, une action parmi `alg`, `free`, `merge`,
-  `size`, `subdiv`, `microfix`, `tet`, plus une phrase de justification.
-- **Le LLM ne construit jamais la recette** : il choisit un levier, et le code applique ce
-  levier (`strategy/levers.py`), filtre les faces inventées et borne les valeurs. Une action
-  inconnue, un serveur absent, un délai dépassé ou un JSON illisible font simplement
-  repartir sur les règles déterministes — le maillage n'échoue jamais à cause du LLM.
-- **Traçabilité** : chaque décision (action, recette obtenue, raison, durée, tokens estimés,
-  réponse brute) est écrite dans le `.json` sous la clé `llm`.
-
-| Clé `[llm]` | Défaut | Rôle |
-|---|---|---|
-| `enabled` | false | activer le conseiller |
-| `base_url` | http://127.0.0.1:8080 | adresse de llama-server |
-| `timeout_s` / `max_tokens` | 60 / 256 | délai d'une décision, longueur de la réponse |
-| `max_attempts_history` / `max_faces` | 10 / 12 | bornes de la charge utile |
-| `min_attempts_before` | 1 | essais échoués avant de solliciter le LLM |
+Compare les `.json` pièce par pièce (statut, type d'élément, nombre d'éléments, jacobien
+min, % hors cibles). Régression = statut moins bon (`OK`/`OK_APPROX` > `OK_TET` >
+`FAILED_QUALITY` > reste), jacobien min en baisse de plus de 0,02 ou hors cibles en hausse de
+plus de 0,1 point à statut égal. Écart de nombre d'éléments > 10 % signalé. Code retour 1
+si au moins une régression. À lancer après toute modification du mailleur.
 
 ## 8. Configuration
 
@@ -242,7 +256,8 @@ stepmesher mesh piece.stp -o out/ --llm            # ou --llm-url http://127.0.0
 
 | Clé | Défaut | Rôle |
 |---|---|---|
-| `mesh.size_frac` | 0,01 | taille cible = fraction de la diagonale OBB… |
+| `mesh.nominal_size_mm` | 10 | taille cible = nominal × min(1, (diag / `nominal_ref_diag_mm`)^`nominal_size_exponent`)… |
+| `mesh.nominal_ref_diag_mm` / `nominal_size_exponent` | 600 / 0,15 | … soit 7,9 mm à 130 mm, 10 mm au-delà de 600 mm (0 = règle `size_frac`)… |
 | `mesh.thickness_factor` | 10 | … plafonnée à k × épaisseur locale… |
 | `mesh.min_size_mm` / `max_size_mm` | 0,5 / 50 | … et bornée |
 | `mesh.n_per_bend` / `n_per_hole` | 4 / 12 | raffinement des plis / trous conservés |
@@ -250,7 +265,8 @@ stepmesher mesh piece.stp -o out/ --llm            # ou --llm-url http://127.0.0
 | `mesh.adaptive_attempts` | 8 | essais adaptatifs supplémentaires par passe |
 | `holes.max_diameter_mm` / `max_diameter_frac` | 12 / 0,02 | seuil de bouchage = min des deux |
 | `healing.small_edge_tol_mm` | [0.02, 0.01] | tolérances de la passe B |
-| `quality.soft_violation_pct` | 0,2 | % d'éléments tolérés hors cible |
+| `quality.soft_violation_pct` / `_variable` | 0,2 / 1,0 | % d'éléments tolérés hors cible (constante / variable) |
+| `quality.soft_violation_min_count` | 5 | nombre d'éléments hors cible toujours toléré (petits maillages) |
 | `tet.order` | 2 | 2 = C3D10, 1 = C3D4 |
 | `general.attempt_timeout_s` / `part_time_budget_s` | 600 / 2400 | délais |
 
@@ -305,8 +321,9 @@ passent en géométrie brute (passe A).
 - **Stratégie `compound`** (surfaces composites globales) : disponible mais retirée des défauts
   (plantages et délais sur les pièces CATIA testées) ; la fusion locale reste un levier adaptatif.
 - **À confirmer au premier datacheck Abaqus** :
-  1. syntaxe de l'orientation par `*DISTRIBUTION` ;
-  2. pour les continuum shells, l'épaisseur mécanique vient de la géométrie nodale ; la valeur
-     écrite dans `*SHELL SECTION` est l'épaisseur nominale de la zone ;
-  3. `STACK DIRECTION=3` avec la numérotation 1-4 / 5-8 produite ;
-  4. C3D10 : ordre des nœuds milieux (vérifié par géométrie, à confirmer par Abaqus).
+  1. pour les continuum shells, l'épaisseur mécanique vient de la géométrie nodale ; la valeur
+     écrite dans `*SHELL SECTION` est une épaisseur nominale constante (moyenne du maillage) ;
+  2. `STACK DIRECTION=3` avec la numérotation 1-4 / 5-8 produite ;
+  3. C3D10 : ordre des nœuds milieux (vérifié par géométrie, à confirmer par Abaqus).
+  - Orientation par élément (`*DISTRIBUTION` / `*ORIENTATION`) retirée pour l'instant :
+    invalide telle quelle dans `*PART`, à réintroduire plus tard depuis `_orientation.csv`.

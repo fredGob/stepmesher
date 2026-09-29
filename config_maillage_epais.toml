@@ -1,0 +1,116 @@
+# Configuration par d├®faut de stepmesher.
+# Copier ce fichier (`stepmesher dump-config > ma_config.toml`), modifier, puis
+# passer `--config ma_config.toml`. Seules les cl├®s pr├®sentes surchargent les d├®fauts.
+# Toutes les longueurs sont en mm.
+
+[general]
+occ_target_unit = "MM"          # conversion d'unit├®s ├á l'import STEP
+attempt_timeout_s = 300         # d├®lai max d'un essai de maillage (sous-processus)
+part_time_budget_s = 900        # budget de temps total par pi├¿ce
+max_attempts = 8                # nombre max d'essais de maillage par pi├¿ce
+threads = 2                     # threads gmsh
+
+[healing]
+enabled = true
+aggressive = false              # true : suppression des micro-ar├¬tes / micro-faces
+tolerance = 1e-6
+volume_rel_tol = 1e-4           # au-del├á, le nettoyage est rejet├® (g├®om├®trie brute conserv├®e)
+small_edge_tol_mm = [0.2, 0.1, 0.05, 0.02, 0.01]  # micro-ar├¬tes supprim├®es ├á l'import (essay├®es
+                                # de la plus grande ├á la plus petite ; au-del├á de ~0.2-0.3 mm,
+                                # OCC casse des faces sur des pi├¿ces CATIA r├®elles)
+max_volume_change = 1e-3        # variation de volume admise pour la suppression des micro-ar├¬tes
+
+occ_wireframe = true            # nettoyage OCP syst├®matique (ShapeFix_Wireframe) avant maillage :
+                                # effondre les micro-ar├¬tes en pr├®servant le solide (kernel OCP requis)
+occ_wireframe_precision_mm = 0.05      # ar├¬tes plus courtes effondr├®es (align├® sur quality.min_absolute_edge_mm)
+occ_wireframe_max_volume_change = 5e-3  # au-del├á, le nettoyage OCP est rejet├® (g├®om├®trie brute conserv├®e)
+
+[analysis]
+sample_size_frac = 0.01         # taille de la triangulation d'analyse (fraction de diagonale)
+sample_curvature = 12           # ├®l├®ments par 2*pi pour la triangulation d'analyse
+max_thickness_mm = 15.0         # ├®paisseur max recherch├®e lors de l'appariement des peaux
+opposite_normal_tol_deg = 25.0  # tol├®rance d'antiparall├®lisme de deux peaux
+patch_angle_deg = 30.0          # angle di├¿dre max ├á l'int├®rieur d'un patch lisse
+skin_ratio = 0.6                # patch = peau si ├®paisseur < skin_ratio * largeur du patch
+constant_thickness_rel_tol = 0.08  # dispersion d'├®paisseur tol├®r├®e pour une t├┤le constante
+sharp_edge_angle_deg = 20.0     # au-del├á, ar├¬te vive entre deux faces de peau
+bend_min_angle_deg = 10.0       # angle mini pour compter une face comme pli
+profile_elongation_min = 2.5    # dims[0]/dims[1] (OBB) au-del├á duquel une pi├¿ce est jug├®e
+                                # assez allong├®e pour ├¬tre un profil├®/lisse (T/Z/L/om├®ga) balay├®
+profile_section_rel_tol = 0.25  # dispersion tol├®r├®e du p├®rim├¿tre de section le long de l'axe
+                                # (les renforts locaux type "pad-up" ├®largissent la section par
+                                # endroits ; seuil cal├® sur des pi├¿ces r├®elles, ├á ajuster)
+profile_n_stations = 12         # nombre de coupes le long de l'axe long pour comparer la section
+profile_margin_frac = 0.15      # marge ignor├®e ├á chaque extr├®mit├® (effets de bord, cong├®s de fin)
+
+[holes]
+fill = true                     # bouchage automatique des petits trous
+max_diameter_mm = 12.0          # seuil absolu (0 = ignor├®)
+max_diameter_frac = 0.02        # seuil relatif ├á la diagonale (0 = ignor├®)
+                                # seuil effectif = min des seuils non nuls
+
+[mesh]
+nominal_size_mm = 0.0           # ancienne regle size_frac conservee pour cette config
+size_frac = 0.02                # taille cible = size_frac * diagonale OBB ...
+thickness_factor = 10.0         # ... plafonn├®e ├á thickness_factor * ├®paisseur ...
+min_size_mm = 1.0               # ... et born├®e ├á [min_size_mm, max_size_mm]
+max_size_mm = 20.0
+micro_edge_ratio = 0.2          # ar├¬te < ratio x min_size_mm : impos├®e par une micro-ar├¬te CAD
+                                # (n┼ôud gliss├® le long du bord ; exempt├®e des seuils de forme)
+n_per_bend = 4                  # ├®l├®ments min sur l'arc d'un pli
+max_bend_angle_deg = 30.0       # angle max repr├®sent├® par un ├®l├®ment dans l'arc d'un pli
+structured_patches = false      # true : TOUTES les faces ├á 4 c├┤t├®s r├®guli├¿res en transfini
+                                # (false : seulement les petites, c├┤t├® <= 3 x taille)
+curvature_n = 24                # ├®l├®ments par tour complet sur les surfaces courbes (0 = off)
+n_per_hole = 12                 # ├®l├®ments min sur le p├®rim├¿tre d'un trou conserv├®
+tangent_angle_deg = 10.0        # fusion en surfaces composites sous cet angle
+reference_skin = "inner"        # inner | outer
+size_variants = [1.0, 0.7]      # multiplicateurs de taille essay├®s pour chaque strat├®gie
+local_repair = true             # bascule d'ar├¬te + lissage local des quads m├®diocres
+repair_threshold = 0.2          # quads vis├®s : jacobien 2D sous ce seuil
+adaptive_attempts = 8           # essais adaptatifs (remaillage local des faces fautives)
+skip_sc8r_below = 0.0           # si > 0 : score de faisabilit├® SC8R (analyze/feasibility) sous
+                                # ce seuil -> repli t├®tra direct sans ├®puiser les essais SC8R.
+                                # 0 = jamais (avis de faisabilit├® seulement journalis├®/summary).
+                                # A calibrer sur une campagne avant d'activer (0.35-0.45 typique).
+strategies = ["conform", "subdiv"]
+                                # disponibles aussi : "compound" (fusion des faces tangentes :
+                                # plante ou d├®passe le d├®lai sur les pi├¿ces CATIA test├®es),
+                                # "blossom" (peut laisser des triangles,
+                                # utile avec allow_wedge_pct > 0), "qqs" (quasi-structur├®, lent)
+
+[tet]
+# Repli t├®tra├®drique : pi├¿ce massive, ou toutes les recettes SC8R en ├®chec.
+enabled = true
+order = 2                       # 2 = C3D10 (d├®faut), 1 = C3D4
+size_frac = 0.025                # taille = size_frac * diagonale ...
+thickness_factor = 1.0          # ... plafonn├®e ├á k * ├®paisseur m├®diane (~2 C3D10 dans l'├®paisseur)
+min_size_mm = 2.0
+max_size_mm = 20.0
+curvature_n = 8                 # raffinement sur les surfaces courbes (├®l├®ments par tour)
+min_size_ratio = 0.25           # taille min = ratio x taille cible
+min_shape_quality = 0.05        # rayon inscrit normalis├® (1 = t├®tra r├®gulier)
+
+[quality]
+# Deux niveaux :
+# - crit├¿res DURS, v├®rifi├®s sur 100 % des ├®l├®ments (sinon la recette ├®choue) ;
+# - crit├¿res CIBLES : au plus soft_violation_pct % d'├®l├®ments hors cible. Ces ├®l├®ments
+#   sont regroup├®s dans l'ELSET ES_QUALITY_WARN et list├®s dans le rapport.
+#   soft_violation_pct = 0 -> tous les crit├¿res deviennent stricts.
+hard_min_scaled_jacobian = 0.1  # DUR : jacobien normalis├® min (hexa, 8 coins) ; <= 0 = retourn├®
+max_reprojection_error = 0.05   # DUR : fraction de l'├®paisseur locale
+max_thickness_deviation = 0.15  # DUR (t├┤le constante) : ├®paisseur d'├®l├®ment vs ├®paisseur locale
+allow_wedge_pct = 0.0           # DUR : % de triangles tol├®r├®s (convertis en SC6R)
+min_absolute_edge_mm = 0.05     # DUR : plus petite ar├¬te tol├®r├®e (mm), jamais exempt├®e, m├¬me pour
+                                # une ar├¬te ┬½ impos├®e par la CAD ┬╗ (0 = d├®sactiv├®)
+min_scaled_jacobian = 0.2       # CIBLE
+max_aspect_ratio = 10.0         # CIBLE : quad dans le plan (ar├¬te max / ar├¬te min)
+min_angle_deg = 20.0            # CIBLE
+max_angle_deg = 160.0           # CIBLE
+max_warp_deg = 20.0             # CIBLE
+soft_violation_pct = 0.2        # % max d'├®l├®ments hors cibles (t├┤le constante)
+soft_violation_pct_variable = 1.0  # idem pour les pi├¿ces ├á ├®paisseur VARIABLE (rampes) : la
+                                # transition d'├®paisseur liss├®e produit quelques ├®l├®ments en biais
+                                # in├®vitables ; tol├®rance plus large (crit├¿res DURS jamais rel├óch├®s)
+
+

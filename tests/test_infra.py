@@ -16,6 +16,11 @@ def test_unknown_config_key_rejected():
         load_config(overrides={"mesh": {"taille": 3}})
 
 
+def test_config_bend_angle_override():
+    c = load_config(overrides={"mesh": {"max_bend_angle_deg": 30.0}})
+    assert c["mesh"]["max_bend_angle_deg"] == 30.0
+
+
 def test_hole_threshold_is_min_of_nonzero():
     c = load_config(overrides={"holes": {"max_diameter_mm": 12.0, "max_diameter_frac": 0.02}})
     assert c.hole_threshold(300.0) == pytest.approx(6.0)
@@ -28,10 +33,15 @@ def test_target_size_bounded_by_thickness_and_limits():
     c = load_config()
     # 12 m de diagonale, 0,4 mm : plafonné par k * t
     assert c.target_size(12000.0, 0.4) == pytest.approx(4.0)
-    # borne max
-    assert c.target_size(12000.0, 10.0) == pytest.approx(c["mesh"]["max_size_mm"])
+    # grande pièce : taille nominale ; petite : un peu moins, sans palier
+    assert c.target_size(12000.0, 10.0) == pytest.approx(10.0)
+    assert c.target_size(130.0, 3.0) == pytest.approx(7.95, abs=0.05)
+    assert c.target_size(130.0, 3.0) < c.target_size(300.0, 3.0) < c.target_size(600.0, 3.0)
     # borne min
     assert c.target_size(10.0, 0.01) == pytest.approx(c["mesh"]["min_size_mm"])
+    # ancienne règle toujours disponible
+    old = load_config(overrides={"mesh": {"nominal_size_mm": 0.0}})
+    assert old.target_size(12000.0, 10.0) == pytest.approx(old["mesh"]["max_size_mm"])
 
 
 def test_recipe_bounds():

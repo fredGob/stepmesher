@@ -13,7 +13,8 @@ REAL_DIR = ROOT / "stps_test"
 
 @pytest.fixture(scope="session")
 def cfg():
-    return load_config()
+    # plaque_poches (usinée, < 400 mm) serait un fitting -> tétra direct : on garde la voie SC8R testée
+    return load_config(overrides={"family": {"tet_direct": []}})
 
 
 @pytest.fixture(scope="session")
