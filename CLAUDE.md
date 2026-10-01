@@ -17,7 +17,7 @@ stepmesher mesh stps_test/ -o out/                  # lot ; summary.csv + par pi
 stepmesher inspect piece.stp                        # analyse seule
 stepmesher validate out/piece.inp                   # validateur interne
 stepmesher dump-config                              # config par défaut (src/stepmesher/default.toml)
-pytest -m "not real"                               # 137 tests synthétiques, ~1 min (20 cœurs)
+pytest -m "not real"                               # 141 tests synthétiques, ~1 min (20 cœurs)
 pytest -m real                                     # 7 tests sur stps_test/, ~20 min
 cp -r src /tmp/vN_src && tools/run_campaign.sh campagne/parts_stp_echelle result_vN 10 /tmp/vN_src
                                                    # campagne en parallèle (Linux), 1 processus/pièce
@@ -26,8 +26,14 @@ cp -r src /tmp/vN_src && tools/run_campaign.sh campagne/parts_stp_echelle result
 Environnements : conteneur 2 cœurs / 7 Go (anciens temps) ; poste Windows de Fred (AGENTS.md) ;
 **machine Linux de Fred** (Fedora, 20 cœurs / 30 Go) : venv `.venv/` du projet (Python 3.12,
 gmsh 4.15.2, cadquery-ocp) -> `.venv/bin/stepmesher`, le python système n'a aucun paquet.
+Dossier du projet : `~/Téléchargements/stepmesher` (ex-`stepmesher-main`, renommé le 01/10/2026 :
+**un venv ne survit pas au renommage de son dossier**, chemins absolus dans `.venv/bin/*` et le
+`.pth` de l'installation éditable -> corrigés à la main ; lien `~/.local/bin/stepmesher` ->
+`.venv/bin/stepmesher` pour la commande hors venv ; jamais de `pip install .` avec le python système).
 **Campagnes de Fred** (`campagne/`) : `parts_stp_echelle` (44 pièces, ex-`stps_test` étendu) et
-`steps_upper` (8 grandes pièces : cadres 2-7 m, part_011 = coque supérieure 11 m / 128 m²).
+`steps_upper` (12 grandes pièces depuis le 01/10/2026 : cadres 2-7 m, 001 à 005 = cadres sœurs,
+part_011 = coque supérieure 11 m / 128 m² ; `parts.csv` en liste 23, d'autres arriveront).
+`stps_test/` n'existe pas sur cette machine (`pytest -m real` sans objet).
 Fred visualise avec `mesh-viewer.html` (lit les `.inp`). **Ne jamais modifier `src/` pendant
 une campagne** : les essais en sous-processus réimportent le code (lancer depuis une copie figée).
 
@@ -281,7 +287,7 @@ tout régulières ») ; ordre validé : 1) détecteur, 2) correction des lanièr
 - Campagnes : `result_v13_*` (détecteur de fissure + tolérance de raccord ; 0 régression vs v12,
   echelle 000/013/014 plus réguliers, 021 continu ; upper identique) ; rendus
   `result_v13_echelle/avant_apres/`.
-- **RÉFÉRENCE = `result_v14_echelle` / `result_v14_upper`** (+ fusion des tranches) : echelle
+- Ancienne référence `result_v14_echelle` / `result_v14_upper` (+ fusion des tranches) : echelle
   identique à v13 (aucune tranche fusionnée) ; upper 000 10 656 -> 5 026 SC8R (petits 33 -> 7 %,
   36 faces fusionnées), 009 10 578 -> 9 361 (29 -> 17 %), 022 10 572 -> 6 704 (15 -> 3 %) ;
   hors cibles 009 79 -> 41, 022 43 -> 6 ; jacobien min un peu plus bas (000 0,28 -> 0,23, 009
@@ -300,7 +306,77 @@ tout régulières ») ; ordre validé : 1) détecteur, 2) correction des lanièr
   fissure, pas empêchée à la source.
 - Outils de vérification utilisés : `stepmesher validate` (continuité incluse) sur tous les .inp
   d'une campagne ; `tools/compare_runs.py vN vN+1` ; rendu avant/après d'une zone :
-  `result_pbm/diag_rayons/render_cmp.py avant.inp apres.inp out.png cx,cy,cz rayon [vue|-]`.
+  `tools/render_cmp.py avant.inp apres.inp out.png cx,cy,cz rayon [vue|-] [titre_avant titre_apres]`
+  (remis dans `tools/` le 01/10 avec `readinp.py` ; `result_pbm/` n'existe plus).
+
+**01/10/2026 — « ça ne marche plus sur d'autres pièces très similaires » (Fred : « le script doit
+être robuste »)** : `steps_upper` passe de 8 à 12 pièces (002 à 005, sœurs de 001). Avec le code
+v14 : 002, 003, 004 FAILED_QUALITY (19 min chacune, budget épuisé), 005 OK (`result_v14_new4`).
+Trois causes, aucune propre à ces pièces :
+- **Aire d'une face longue et étroite fausse de 0,2 à 1,2 %** (intégration PAR DÉFAUT de
+  `BRepGProp.SurfaceProperties` : âme de 6,9 m x 24 mm = 167 657 ou 165 223 mm² selon la pièce,
+  pour 167 279 ; l'erreur change avec le découpage du contour). `occ/virtual.build_virtual_skin`
+  comparait l'aire de la face reconstruite à l'ancienne à 1e-3 près -> « face invalide », âme
+  laissée en maillage LIBRE (éléments de 37-50 mm en biais, retournés ; 003 et 004). **Corrigé** :
+  intégration adaptative (`AREA_EPS = 1e-6`, `area_exact`, aussi dans `merge_slices`) ; l'aire par
+  défaut ne sert plus qu'à retrouver les faces de gmsh (`getMass` intègre de la même façon).
+  Effet de bord utile sur echelle (faces jusque-là refusées à tort) : 004, 005, 011, 018.
+- **`skin_maps` : polyligne à pas uniforme en paramètre (401 points)** : dans une longue courbe
+  concaténée (485 mm, echelle 018), un petit arc n'avait que quelques points -> flèche > 0,05 mm ->
+  « courbes de peau sans correspondance » -> TOUTE la topologie virtuelle de la pièce rejetée
+  (démasqué par la correction d'aire). **Corrigé** : raffinement là où la corde s'écarte de la
+  courbe. 018 : 827 -> 640 él., petits 10,9 -> 0,7 %, étoiles 54 -> 0 (face 214 x 140).
+- **Faces-lanières de 0,1 mm de large dans la peau** (002 : 24, 004 : 12 ; 7 à 25 mm de long, en
+  travers des semelles et des plis au droit des marches d'épaisseur, x = 6238 / 6459 / 9315 /
+  9370 / 12472 / 12545 ; certaines triangulaires, 0 -> 0,1 mm). Maillées : 2 segments de 0,05 mm
+  dans la largeur (parité) -> critère dur d'arête mini + hexa écrasés. Nettoyage OCP 0,1 mm : leurs
+  bouts (0,0999 mm) sont effondrés -> faces d'AIRE NULLE à 2 courbes, « non triangulées,
+  ignorées » à l'analyse puis « face de référence non maillée » à tous les essais. Couture OCC
+  (`BRepBuilderAPI_Sewing` après retrait des lanières) : 36 bords libres, solide invalide, dV/V
+  0,5-1 % -> abandonnée. **Fait : couture AU MAILLAGE (`[mesh] sliver_seam_max_width_mm` = 0,3)** :
+  - `analyze/features.detect_sliver_seams` (dans `prepare_part`, sur toutes les faces du brep, y
+    compris écrasées / non triangulées) : face à une boucle, largeur moyenne 2A/P < seuil, contour
+    = DEUX chaînes de courbes longues (>= 5 x seuil) séparées par des bouts courts ou un demi-tour
+    (> 120° : pointe d'un triangle, face à 2 courbes), longueurs voisines, bouts rapprochés, les
+    deux chaînes bordant la peau de référence (lanières accolées : chaînes extrêmes). La lanière
+    est RETIRÉE de `ref_faces` / `flank_faces` / `bends` (donc du modèle de peau) ; `pa.seams`
+    (face, a, b, width, length), `pa.sliver_faces`, message dans le log ;
+  - `quad.skin_view` traduit les courbes (modèle de peau) ; `quad.seam_chains` ordonne et oriente
+    les deux chaînes et repère les bouts de lanière restés dans le modèle (`links`) ;
+  - `quad.structured_plan(seams=)` : la couture est une pseudo-face (numéro < 0, kind « couture »)
+    à deux côtés opposés = mêmes totaux, nombres PAIRS, sans surface ; hors planification (plis
+    libres, pas de solution) : `quad.seam_counts`, avant les faces structurées ;
+  - `quad.weld_seams` (juste après `extract_reference_mesh`, avant toute retouche) : k-ième nœud
+    de b remplacé par le k-ième de a (qui reste sur sa courbe ; déplacement <= largeur, 0,18 mm
+    max ici) ; refus si comptes différents ou glissement > 0,45 x pas local. **Bout de lanière
+    posé sur le bord d'une face NON coupée** (l'âme) : son quad se réduit à un triangle ->
+    `_collapse_chords` : deux triangles accolés autour du nœud soudé (face libre, 2 segments sur
+    le bout) réunis en un quad ; sinon la colonne est refermée de proche en proche jusqu'à un
+    bord (« chord collapse », nœud au milieu sauf nœud épinglé = sommet CAO / couture). Jamais de
+    quad retiré sans refermer : ça laissait un TROU triangulaire de 3 x 8 mm que ni
+    `mesh_cracks` ni le validateur ne voient ;
+  - `attempt` : une couture non soudée = échec explicite « maillage DISCONTINU : n couture(s) de
+    face-lanière non soudée(s) » (la fente de 0,1 mm est plus large que `crack_tol_mm` = 0,05).
+  Tests `tests/test_seams.py` (détection, soudure en rangées et en libre, colonne refermée).
+- **RÉFÉRENCE = `result_v15_echelle` / `result_v15_upper`** (01/10/2026) :
+  - upper **12/12** (1 OK, 11 OK_APPROX), 0 régression vs v14 sur les 8 anciennes ; 002, 003, 004,
+    005 : **22 740 SC8R chacune, 1 essai (`conform×1`, géométrie nettoyée), jacobien min 0,34-0,36,
+    0 % de petits éléments, 0 étoile**, ~3,5 à 4 min ; 018 : 21 014 -> 19 544, étoiles 18 -> 0 ;
+    011 identique (789 343, 867 s) ; 12 .inp valides et continus ;
+  - echelle **44/44** identique en statuts, SC8R 45 409 -> 44 826, petits 7,5 -> 6,1 %, étoiles
+    120 -> 66 ; changent seulement 004 (981 -> 900, petits 17,5 -> 7,6 %), 005 (350 -> 320,
+    12,3 -> 1,8 %), 011 (631 -> 564, 20,6 -> 6,6 %), 018 ;
+  - rendus `result_v15_upper/avant_apres/` (002, 003, 004) et `result_v15_echelle/avant_apres/018.png`.
+- **Reste / à savoir** : (a) le seuil 0,3 mm est absolu, non testé au-delà de 0,18 mm de large ;
+  une lanière en BORD de peau (une chaîne sur un chant) ou sans deux chaînes nettes n'est pas
+  traitée (reste une face ordinaire) ; (b) le repli tétra ne profite pas des coutures (lanières
+  toujours dans le solide : « aucun maillage tétraédrique » sur 002/004 avec l'ancien code) ;
+  (c) une géométrie nettoyée inutilisable consomme toujours 50 % du budget avant la brute ;
+  (d) quand la topologie virtuelle refuse UNE face (`skin_info.messages`), une lanière de 7 m
+  peut rester libre sans autre alerte que les étoiles : à surveiller sur les prochaines pièces ;
+  (e) echelle 018 garde un nœud de maillage libre au milieu de la grande face (fin d'une ligne
+  CAO intérieure), non signalé ; (f) upper 020/021 face 7 (85 étoiles) et 009 (17 % de petits)
+  inchangés.
 
 Piste de travail du 28/09 (points 1 à 3 faits depuis : diagnostic, régularité, topologie) :
 1. diagnostic chiffré sur part_004 puis sur toute `result_v7` : par pli (toutes ses faces),
