@@ -25,6 +25,12 @@ import numpy as np
 
 # écart toléré entre le bout d'une courbe et le début de la suivante lors de la concaténation
 JOIN_TOL_MIN_MM = 1e-4
+# aires comparées (face reconstruite / face d'origine) : intégration ADAPTATIVE. L'intégration
+# par défaut d'OCC se trompe de 0,2 à 1,2 % sur une face longue et étroite (âme de 6,9 m x 24 mm
+# des cadres upper 003/004 : 167 657 ou 165 223 mm² pour 167 279), et l'erreur change avec le
+# découpage du contour -> la face reconstruite, pourtant identique, était refusée (« face
+# invalide ») et l'âme restait en maillage libre.
+AREA_EPS = 1e-6
 
 
 def _s(obj, name):
@@ -87,7 +93,7 @@ def merge_slices(match: dict, max_slice_mm: float, tangent_deg: float = 5.0, dev
 
     def area(f):
         g = GProp_GProps()
-        _s(BRepGProp, "SurfaceProperties")(f, g)
+        _s(BRepGProp, "SurfaceProperties")(f, g, AREA_EPS)   # intégration adaptative, voir AREA_EPS
         return g.Mass()
 
     def pnt(p):
@@ -453,6 +459,13 @@ def build_virtual_skin(brep_in: str, ref_faces: list[dict], out_path: str, max_e
         c = g.CentreOfMass()
         return g.Mass(), np.array([c.X(), c.Y(), c.Z()])
 
+    def area_exact(f):
+        # area_centre (intégration par défaut) sert à retrouver les faces de gmsh, qui intègre
+        # de la même façon ; pour comparer deux faces, intégration adaptative (voir AREA_EPS)
+        g = GProp_GProps()
+        surf_props(f, g, AREA_EPS)
+        return g.Mass()
+
     def length(e):
         g = GProp_GProps()
         lin_props(e, g)
@@ -565,7 +578,7 @@ def build_virtual_skin(brep_in: str, ref_faces: list[dict], out_path: str, max_e
                 merged.append(round(sum(L[k] for k in run), 3))
             if not mw.IsDone():
                 raise RuntimeError("contour")
-            a_old, _ = area_centre(ff)
+            a_old = area_exact(ff)
             nf, a_new = None, 0.0
             # sens du nouveau contour : celui qui redonne une aire positive
             for wire in (mw.Wire(), wire_of(mw.Wire().Reversed())):
@@ -578,7 +591,7 @@ def build_virtual_skin(brep_in: str, ref_faces: list[dict], out_path: str, max_e
                 fix = ShapeFix_Face(mf.Face())
                 fix.Perform()
                 nf = fix.Face()
-                a_new, _ = area_centre(nf)
+                a_new = area_exact(nf)
                 if a_new > 0:
                     break
             if nf is None:
@@ -651,7 +664,21 @@ def skin_maps(skin_brep: str, ref_faces: list[dict], old_curves: dict, tol: floa
         seg_a, seg_b, owner = [], [], []
         for _, c in gmsh.model.getEntities(1):
             lo, hi = gmsh.model.getParametrizationBounds(1, c)
-            P = np.array(gmsh.model.getValue(1, c, np.linspace(lo[0], hi[0], 401).tolist())).reshape(-1, 3)
+            # pas uniforme en paramètre, raffiné là où la corde s'écarte de la courbe : dans une
+            # longue courbe concaténée (485 mm, echelle part_018), un petit arc ne recevait que
+            # quelques points -> flèche > tol, « courbes de peau sans correspondance » et toute
+            # la topologie virtuelle de la pièce rejetée
+            ts = np.linspace(lo[0], hi[0], 401)
+            P = np.array(gmsh.model.getValue(1, c, ts.tolist())).reshape(-1, 3)
+            for _ in range(8):
+                tm = 0.5 * (ts[:-1] + ts[1:])
+                M = np.array(gmsh.model.getValue(1, c, tm.tolist())).reshape(-1, 3)
+                bad = np.linalg.norm(M - 0.5 * (P[:-1] + P[1:]), axis=1) > 0.2 * tol
+                if not bad.any() or len(ts) > 200000:
+                    break
+                order = np.argsort(np.r_[ts, tm[bad]], kind="stable")
+                ts = np.r_[ts, tm[bad]][order]
+                P = np.vstack([P, M[bad]])[order]
             seg_a.append(P[:-1])
             seg_b.append(P[1:])
             owner += [c] * (len(P) - 1)

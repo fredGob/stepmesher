@@ -20,7 +20,7 @@ from ..mesh.hexa import build_solid_shell
 from ..mesh.offset import offset_nodes
 from ..mesh.repair import align_columns, fix_micro_edges, flip_repair, relax_boundary
 from ..mesh.quad import (apply_strategy, even_boundaries, extract_reference_mesh, nodes_on_curves,
-                         regular_expected_faces, setup_reference_model, skin_view)
+                         regular_expected_faces, setup_reference_model, skin_view, seam_chains, weld_seams)
 from ..mesh.sizing import apply_sizing, base_size
 from ..occ.loader import gmsh_session
 from .recipe import Recipe
@@ -114,6 +114,8 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
             pm, n2o, o2n = skin_view(pa)
             rc_m = _recipe_in(rc, o2n)
             res["virtual_topology"] = n2o is not None
+            # coutures des faces-lanières retirées de la peau (chaînes orientées, modèle courant)
+            seams = seam_chains(pm)
             # stratégie (transfinis, fusion des micro-courbes) AVANT le champ de taille : les
             # courbes fusionnées n'imposent plus de nœud et ne doivent plus être raffinées
             res["strategy_info"] = apply_strategy(
@@ -122,7 +124,7 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
                 bool(cfg["mesh"].get("bend_angle_floor", False)), bool(cfg["mesh"].get("contour_arcs", False)),
                 float(cfg["mesh"].get("large_face_elements", 0.0)), int(cfg["mesh"].get("large_face_alg", 6)),
                 bool(cfg["mesh"].get("structured_harmonize", False)),
-                float(cfg["mesh"].get("structured_patch_max_side_frac", 8.0)))
+                float(cfg["mesh"].get("structured_patch_max_side_frac", 8.0)), seams=seams)
             res["sizing"] = apply_sizing(pm, cfg, rc_m, set(res["strategy_info"].get("merged_curves", [])),
                                          set(res["strategy_info"].get("structured_list", [])))
             t1 = time.time()
@@ -130,7 +132,8 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
                 try:
                     res["parity_fixes"] = even_boundaries(
                         pm, set(res["strategy_info"].get("structured_list", [])) |
-                        set(res["strategy_info"].get("structured_patch_list", [])))
+                        set(res["strategy_info"].get("structured_patch_list", [])),
+                        set(res["strategy_info"].get("seam_curves", [])))
                 except Exception as e:  # noqa: BLE001
                     res["parity_fixes"] = f"erreur : {e}"[:200]
             try:
@@ -141,6 +144,9 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
                 res["gmsh_warning"] = str(e)[:300]
             res["timings"]["quad"] = time.time() - t1
             qm = extract_reference_mesh(pm)
+            if seams:
+                # bords des faces-lanières soudés nœud à nœud (avant toute retouche du maillage)
+                res["seam_weld"] = weld_seams(qm, seams)
             X_gmsh = qm.X.copy()
             res["micro_edge_moves"] = fix_micro_edges(qm, cfg["mesh"]["micro_edge_ratio"] * cfg["mesh"]["min_size_mm"])
             if cfg["mesh"].get("align_columns", False) and len(qm.quads):
@@ -216,6 +222,15 @@ def run_attempt(analysis_json: str, recipe: dict, cfg_data: dict, out_prefix: st
             if missing:
                 res["status"] = "failed"
                 res["reasons"] = [f"{len(missing)} face(s) de référence non maillée(s) : {missing[:10]}"]
+                return _finish(res, out, t0)
+            # couture manquée = fente de la largeur de la lanière (0,1 mm), plus large que le seuil
+            # du critère de continuité : échec explicite
+            n_seams = len(getattr(pa, "seams", None) or [])
+            n_welded = (res.get("seam_weld") or {}).get("seams", 0)
+            if n_welded < n_seams:
+                res["status"] = "failed"
+                res["reasons"] = [f"maillage DISCONTINU : {n_seams - n_welded} couture(s) de face-lanière non "
+                                  f"soudée(s) sur {n_seams}"]
                 return _finish(res, out, t0)
             # nœuds (indices locaux) de chaque pli structuré, pour la recette adaptative
             lookup = {int(t): i for i, t in enumerate(qm.node_tags)}

@@ -76,6 +76,12 @@ def skin_view(pa):
     pm.face_cad_sign = {fo(f): v for f, v in pa.face_cad_sign.items()}
     pm.face_adjacency = [[fo(a), fo(b), ang] for a, b, ang in pa.face_adjacency]
     pm.holes_kept = [dict(h, faces=[fo(w) for w in h["faces"]]) for h in pa.holes_kept]
+    # coutures : courbes du modèle de peau (une couture dont une courbe n'a pas de
+    # correspondance est abandonnée : la fissure sera vue par le critère de continuité)
+    pm.seams = [dict(sm, a=list(dict.fromkeys(cmap[c] for c in sm["a"])),
+                     b=list(dict.fromkeys(cmap[c] for c in sm["b"])))
+                for sm in (getattr(pa, "seams", None) or [])
+                if all(c in cmap for c in sm["a"] + sm["b"])]
     return pm, n2o, o2n
 
 
@@ -105,6 +111,110 @@ def tangent_groups(pa, angle_deg: float, exclude: set[int] = frozenset()) -> lis
 
 def _even(n: int) -> int:
     return max(2, n + (n % 2))
+
+
+def _chain_path(curves):
+    """Courbes d'une chaîne ouverte dans l'ordre de parcours : [(courbe, sommet de départ,
+    sommet d'arrivée)], ou None (courbe absente du modèle, chaîne fermée ou ramifiée)."""
+    ep = {}
+    for c in curves:
+        pts = [abs(t) for _, t in gmsh.model.getBoundary([(1, c)], oriented=False)]
+        if len(pts) != 2 or pts[0] == pts[1]:
+            return None
+        ep[c] = pts
+    deg: dict[int, int] = {}
+    for pts in ep.values():
+        for p in pts:
+            deg[p] = deg.get(p, 0) + 1
+    tips = sorted(p for p, n in deg.items() if n == 1)
+    if len(tips) != 2 or any(n > 2 for n in deg.values()):
+        return None
+    out, cur, left = [], tips[0], set(curves)
+    while left:
+        c = next((c for c in left if cur in ep[c]), None)
+        if c is None:
+            return None
+        nxt = ep[c][1] if ep[c][0] == cur else ep[c][0]
+        out.append((int(c), int(cur), int(nxt)))
+        left.remove(c)
+        cur = nxt
+    return out
+
+
+def _short_link(p: int, q: int, max_len: float, max_curves: int = 3) -> list[int]:
+    """Courbes courtes (<= max_len) reliant directement les sommets p et q (au plus max_curves
+    courbes bout à bout), [] s'il n'y en a pas : bout d'une face-lanière resté dans le modèle
+    parce qu'il borde une autre face de la peau."""
+    if p == q:
+        return []
+    seen, front = {p: []}, [p]
+    for _ in range(max_curves):
+        nxt = []
+        for v in front:
+            for c in gmsh.model.getAdjacencies(0, v)[0]:
+                c = int(c)
+                if gmsh.model.occ.getMass(1, c) > max_len:
+                    continue
+                for _, w in gmsh.model.getBoundary([(1, c)], oriented=False):
+                    w = abs(w)
+                    if w not in seen:
+                        seen[w] = seen[v] + [c]
+                        nxt.append(w)
+        if q in seen:
+            return seen[q]
+        front = nxt
+    return []
+
+
+def seam_chains(pa) -> list[dict]:
+    """Coutures (pa.seams, faces-lanières retirées de la peau) dans le modèle courant : deux
+    chaînes ordonnées et parcourues dans le MÊME sens. [dict(face, a, b, links)], a et b =
+    [(courbe, sommet de départ, sommet d'arrivée)] ; links = (courbes du bout de la lanière
+    encore présentes au début, à la fin) : elles se réduisent à un point à la soudure.
+    Couture ignorée si une chaîne ne se retrouve pas dans le modèle (attempt : échec explicite)."""
+    out = []
+    for sm in getattr(pa, "seams", None) or []:
+        try:
+            a, b = _chain_path(list(sm["a"])), _chain_path(list(sm["b"]))
+            if a is None or b is None:
+                continue
+            P = {p: np.array(gmsh.model.getValue(0, p, []), float) for p in (a[0][1], a[-1][2], b[0][1], b[-1][2])}
+            same = np.linalg.norm(P[a[0][1]] - P[b[0][1]]) + np.linalg.norm(P[a[-1][2]] - P[b[-1][2]])
+            cross = np.linalg.norm(P[a[0][1]] - P[b[-1][2]]) + np.linalg.norm(P[a[-1][2]] - P[b[0][1]])
+            if cross < same:
+                b = [(c, p1, p0) for c, p0, p1 in reversed(b)]
+            lim = max(1.0, 5.0 * float(sm.get("width", 0.0)))
+            links = (_short_link(a[0][1], b[0][1], lim), _short_link(a[-1][2], b[-1][2], lim))
+            out.append(dict(face=int(sm.get("face", 0)), a=a, b=b, links=links))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def seam_counts(seams: list[dict], h: float, fixed: dict) -> list[int]:
+    """Mêmes nombres de segments (pairs) sur les deux chaînes de chaque couture, hors
+    planification harmonisée (plis libres, ancien enchaînement). Les courbes déjà imposées
+    (fixed : courbe -> nombre de nœuds) sont respectées. Renvoie les faces des coutures réglées."""
+    done = []
+    for sm in seams:
+        ca, cb = [c for c, _, _ in sm["a"]], [c for c, _, _ in sm["b"]]
+        try:
+            L = {c: gmsh.model.occ.getMass(1, c) for c in ca + cb}
+            cnt = {c: fixed[c] - 1 if c in fixed else _even(int(round(L[c] / h))) for c in ca + cb}
+            ta, tb = sum(cnt[c] for c in ca), sum(cnt[c] for c in cb)
+            if ta != tb:
+                cand = [c for c in (ca if ta < tb else cb) if c not in fixed]
+                if not cand:
+                    continue
+                cnt[max(cand, key=lambda c: L[c])] += abs(ta - tb)
+            for c in ca + cb:
+                if c not in fixed:
+                    gmsh.model.mesh.setTransfiniteCurve(c, cnt[c] + 1)
+                    fixed[c] = cnt[c] + 1
+            done.append(sm["face"])
+        except Exception:  # noqa: BLE001
+            continue
+    return done
 
 
 def _split_count(lengths: list[float], total: int, even=None) -> list[int]:
@@ -839,7 +949,7 @@ def structured_plan(pa, recipe, h0: float, size_factor: float, fixed: dict,
                     max_bend_angle_deg: float = 30.0, min_bend_size_frac: float = 0.0,
                     angle_floor: bool = False, strips_on: bool = True, patch_max_side: float | None = None,
                     max_width_factor: float = 4.0, min_length_ratio: float = 3.0, min_size_frac: float = 0.35,
-                    max_sweeps: int = 400) -> dict:
+                    max_sweeps: int = 400, seams: list | None = None) -> dict:
     """Faces structurées (transfini) planifiées ENSEMBLE : plis, lanières, petites faces à 4 côtés.
 
     L'ancien enchaînement face par face (plis, puis lanières, puis petites faces, face ignorée
@@ -852,7 +962,10 @@ def structured_plan(pa, recipe, h0: float, size_factor: float, fixed: dict,
     chaque face aient le même total et que les courbes bordant une face libre aient un
     nombre pair (full-quad) ; 3) une face impossible à harmoniser redevient libre (et elle
     seule) ; 4) application. Renvoie dict(bends, strips, patches, dropped), ou None si
-    l'harmonisation n'aboutit pas (l'appelant revient à l'enchaînement face par face)."""
+    l'harmonisation n'aboutit pas (l'appelant revient à l'enchaînement face par face).
+    seams (seam_chains) : coutures des faces-lanières retirées de la peau, planifiées comme une
+    face à deux côtés (les deux chaînes : même total, nombres pairs) sans surface à mailler ;
+    rendues dans out["seams"] (faces des coutures satisfaites)."""
     ref = set(pa.ref_faces)
     free = set(getattr(recipe, "free_faces", ()) or ())
     h = h0 * size_factor
@@ -951,12 +1064,25 @@ def structured_plan(pa, recipe, h0: float, size_factor: float, fixed: dict,
             plans.append(dict(face=int(f), kind="patch", sides=sides, lens=lens, corners=corners, target=tgt))
             planned.add(int(f))
 
+    # coutures : pseudo-faces (numéros < 0) à deux côtés opposés, sans surface
+    seam_curves: set[int] = set()
+    seam_of: dict[int, int] = {}
+    for i, sm in enumerate(seams or []):
+        ca, cb = [c for c, _, _ in sm["a"]], [c for c, _, _ in sm["b"]]
+        la, lb = [clen(c) for c in ca], [clen(c) for c in cb]
+        key = -1_000_000 - i
+        seam_of[key] = sm["face"]
+        seam_curves.update(ca + cb)
+        plans.append(dict(face=key, kind="couture", sides=[ca, [], cb, []], lens=[la, [], lb, []], corners=None,
+                          target=[_even(int(round(max(sum(la), sum(lb)) / h))), 0]))
+
     # ---- 2) harmonisation (ajouts seulement) ----
     dropped: list[int] = []
     solved = False
     for _round in range(10):
         active = {p["face"] for p in plans}
         even_req = {c for c, fs in faces_of.items() if any(g not in active for g in fs) and len(fs) > 1}
+        even_req |= seam_curves
         cur: dict[int, int] = {}
         for p in plans:
             for k in (0, 1):
@@ -1004,7 +1130,7 @@ def structured_plan(pa, recipe, h0: float, size_factor: float, fixed: dict,
         return None                  # pas de solution : ancien enchaînement face par face
 
     # ---- 3) application ----
-    out = dict(bends=[], strips=[], patches=[], dropped=sorted(set(dropped)))
+    out = dict(bends=[], strips=[], patches=[], seams=[], dropped=sorted(f for f in set(dropped) if f >= 0))
     key = dict(pli="bends", lanière="strips", patch="patches")
     for p in plans:
         want = {c: cur[c] + 1 for sd in p["sides"] for c in sd}
@@ -1012,6 +1138,10 @@ def structured_plan(pa, recipe, h0: float, size_factor: float, fixed: dict,
             for c, n1 in want.items():
                 if c not in fixed:
                     gmsh.model.mesh.setTransfiniteCurve(c, n1)
+            if p["kind"] == "couture":
+                fixed.update(want)
+                out["seams"].append(seam_of[p["face"]])
+                continue
             if p["corners"] is None:
                 gmsh.model.mesh.setTransfiniteSurface(p["face"])
             else:
@@ -1054,8 +1184,9 @@ def apply_strategy(pa, recipe, h0: float, patches_on: bool = True,
                    max_bend_angle_deg: float = 15.0, min_bend_size_frac: float = 0.0,
                    bend_angle_floor: bool = False, contour_arcs_on: bool = False,
                    large_face_elements: float = 0.0, large_face_alg: int = 6, harmonize: bool = False,
-                   patch_max_frac: float = 8.0) -> dict:
+                   patch_max_frac: float = 8.0, seams: list | None = None) -> dict:
     s = recipe.strategy
+    seams = seams or []
     gmsh.option.setNumber("Mesh.RecombineAll", 1)
     gmsh.option.setNumber("Mesh.Smoothing", 5)
     gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 0)
@@ -1069,8 +1200,15 @@ def apply_strategy(pa, recipe, h0: float, patches_on: bool = True,
         plan = structured_plan(pa, recipe, h0, sf, fixed, max_bend_angle_deg, min_bend_size_frac,
                                bend_angle_floor, strips_on=getattr(recipe, "strips", True),
                                patch_max_side=(float("inf") if patches_on else patch_max_frac * h0)
-                               if s in ("conform", "compound", "blossom") else None)
+                               if s in ("conform", "compound", "blossom") else None, seams=seams)
     info["structured_harmonized"] = plan is not None
+    # coutures hors planification (plis libres, pas de solution, couture écartée) : comptes
+    # imposés directement, AVANT les faces structurées de l'ancien enchaînement
+    seam_done = list(plan["seams"]) if plan is not None else []
+    if s != "qqs":
+        seam_done += seam_counts([sm for sm in seams if sm["face"] not in seam_done], h0 * sf, fixed)
+    info["seams"] = len(seam_done)
+    info["seam_curves"] = sorted({c for sm in seams for c, _, _ in sm["a"] + sm["b"]})
     if plan is not None:
         info["structured_bends"] = len(plan["bends"])
         info["structured_strips"] = plan["strips"]
@@ -1100,6 +1238,7 @@ def apply_strategy(pa, recipe, h0: float, patches_on: bool = True,
     merged_c: set[int] = set()
     if s != "qqs":
         fixed_c = {abs(c) for f in bends for _, c in gmsh.model.getBoundary([(2, f)], oriented=False)}
+        fixed_c |= set(info["seam_curves"])
         # points/arêtes CAD trop proches (rayon isolé, jonction serrée...) : fusionnés en
         # courbe composite avant maillage, sinon un point CAD isolé impose un nœud et un
         # éventail d'éléments minuscules autour, même si le champ de taille est grossier
@@ -1242,6 +1381,172 @@ def extract_reference_mesh(pa) -> QuadMesh:
                     quad_face=np.concatenate(qf) if qf else np.zeros(0, np.int64),
                     tri_face=np.concatenate(tf) if tf else np.zeros(0, np.int64), other_elems=other,
                     fixed=fixed)
+
+
+def _chain_node_tags(chain) -> list[int]:
+    """Numéros gmsh des nœuds d'une chaîne (seam_chains), dans l'ordre de parcours."""
+    seq: list[int] = []
+    for c, p0, p1 in chain:
+        tags, _, par = gmsh.model.mesh.getNodes(1, c, includeBoundary=False, returnParametricCoord=True)
+        order = np.argsort(np.asarray(par, float))
+        lo, hi = gmsh.model.getParametrizationBounds(1, c)
+        x0 = np.array(gmsh.model.getValue(0, p0, []), float)
+        if np.linalg.norm(np.array(gmsh.model.getValue(1, c, [lo[0]]), float) - x0) > \
+                np.linalg.norm(np.array(gmsh.model.getValue(1, c, [hi[0]]), float) - x0):
+            order = order[::-1]
+        t0 = int(gmsh.model.mesh.getNodes(0, p0)[0][0])
+        if not seq or seq[-1] != t0:
+            seq.append(t0)
+        seq += [int(tags[i]) for i in order]
+        seq.append(int(gmsh.model.mesh.getNodes(0, p1)[0][0]))
+    return seq
+
+
+def _collapse_chords(Q: np.ndarray, R: np.ndarray, X: np.ndarray, pinned: np.ndarray, max_merges: int = 5000):
+    """Colonnes de quads refermées après une soudure : un quad dont une arête s'est réduite à un
+    point (le bout d'une face-lanière posé sur le bord d'une face voisine non coupée, âme des
+    cadres upper 002 / 004) est retiré et son arête OPPOSÉE est refermée à son tour, de proche en
+    proche jusqu'à un bord (« chord collapse ») : la colonne en coin disparaît, le maillage reste
+    100 % quads et sans trou. Nœud fusionné au milieu des deux, sauf si l'un est épinglé (sommet
+    CAO, nœud d'une couture). Avant cela, deux quads réduits à deux triangles ACCOLÉS autour du
+    même nœud (face libre : le bout de lanière y porte 2 segments, parité) sont réunis en un
+    seul quad, sans propagation. Renvoie (Q, R, quads gardés, triangles gardés, nombre de
+    fusions), ou None si la propagation ne s'arrête pas. X modifié en place."""
+    Q, R = Q.copy(), R.copy()
+    keep_q, keep_r = np.ones(len(Q), bool), np.ones(len(R), bool)
+    n_merge = 0
+
+    def tri(i):
+        """Quad i réduit à un triangle (p, c, d) dans son sens de parcours, ou None."""
+        q = Q[i].tolist()
+        if len(set(q)) != 3:
+            return None
+        k = next(k for k in range(4) if q[k] == q[(k + 1) % 4])
+        return q[k], q[(k + 2) % 4], q[(k + 3) % 4]
+
+    # triangles accolés autour du même nœud -> un quad
+    deg = [int(i) for i in np.nonzero((Q == np.roll(Q, -1, axis=1)).any(axis=1))[0]]
+    tris = {i: tri(i) for i in deg}
+    for i in deg:
+        if not keep_q[i] or tris[i] is None:
+            continue
+        p, c, d = tris[i]
+        for j in deg:
+            if j == i or not keep_q[j] or tris[j] is None or tris[j][0] != p:
+                continue
+            _, c2, d2 = tris[j]
+            if d2 == c and c2 != d:
+                Q[i] = (p, c2, c, d)
+            elif c2 == d and d2 != c:
+                Q[i] = (p, c, d, d2)
+            else:
+                continue
+            keep_q[j] = False
+            tris[i] = None
+            break
+    while True:
+        deg = np.nonzero(keep_q & ((Q == np.roll(Q, -1, axis=1)).any(axis=1)))[0]
+        if not len(deg):
+            break
+        i = int(deg[0])
+        q = Q[i].tolist()
+        keep_q[i] = False
+        if len(set(q)) != 3:
+            continue                                   # réduit à une arête ou à un point
+        k = next(k for k in range(4) if q[k] == q[(k + 1) % 4])
+        c, d = q[(k + 2) % 4], q[(k + 3) % 4]
+        if pinned[c] and pinned[d]:
+            return None                                # deux nœuds imposés : pas de fermeture possible
+        n_merge += 1
+        if n_merge > max_merges:
+            return None
+        if pinned[d]:
+            X[c] = X[d]
+        elif not pinned[c]:
+            X[c] = 0.5 * (X[c] + X[d])
+        pinned[c] = pinned[c] or pinned[d]
+        Q[Q == d] = c
+        R[R == d] = c
+    if len(R):
+        keep_r = np.array([len(set(t)) == 3 for t in R.tolist()], bool)
+    return Q, R, keep_q, keep_r, n_merge
+
+
+def weld_seams(qm: QuadMesh, seams: list[dict], max_shift_frac: float = 0.45) -> dict:
+    """Soude les deux bords de chaque couture (faces-lanières retirées de la peau, seam_chains) :
+    le k-ième nœud de la chaîne b est remplacé par le k-ième de la chaîne a (qui garde sa
+    position, sur sa courbe CAO). Les deux chaînes ont le même nombre de nœuds (apply_strategy).
+    Une couture est refusée, et laissée ouverte (fissure vue par le critère de continuité), si
+    les comptes diffèrent ou si un nœud devrait glisser de plus de max_shift_frac x le pas local
+    le long du bord. Les quads réduits à un triangle par la soudure (bout de lanière sur le bord
+    d'une face voisine) sont résorbés avec leur colonne (_collapse_chords) ; si c'est
+    impossible, rien n'est soudé. Modifie qm en place.
+    Renvoie dict(seams, nodes, failed, max_shift_mm, chord_merges)."""
+    info = dict(seams=0, nodes=0, failed=[], max_shift_mm=0.0, chord_merges=0)
+    if not seams:
+        return info
+    lk = {int(t): i for i, t in enumerate(qm.node_tags)}
+    remap = np.arange(len(qm.X))
+    for sm in seams:
+        try:
+            ta, tb = _chain_node_tags(sm["a"]), _chain_node_tags(sm["b"])
+            if len(ta) != len(tb) or any(t not in lk for t in ta + tb):
+                info["failed"].append(dict(face=sm["face"], reason=f"{len(ta)} / {len(tb)} nœuds"))
+                continue
+            ia, ib = np.array([lk[t] for t in ta]), np.array([lk[t] for t in tb])
+            d = np.linalg.norm(qm.X[ia] - qm.X[ib], axis=1)
+            seg = np.linalg.norm(np.diff(qm.X[ia], axis=0), axis=1)
+            step = np.minimum(np.r_[seg[0], seg], np.r_[seg, seg[-1]])
+            if (d > max_shift_frac * step).any():
+                k = int(np.argmax(d / np.maximum(step, 1e-30)))
+                info["failed"].append(dict(face=sm["face"], reason=f"écart {d[k]:.3f} mm pour un pas de {step[k]:.3f}"))
+                continue
+            remap[ib] = ia
+            # bouts de la lanière restés dans le modèle (bord d'une face voisine non coupée) :
+            # tous leurs nœuds vont sur le nœud soudé du bout
+            for cs, tgt in zip(sm.get("links") or ((), ()), (ia[0], ia[-1])):
+                for c in cs:
+                    for t in gmsh.model.mesh.getNodes(1, c, includeBoundary=True)[0]:
+                        if int(t) in lk:
+                            remap[lk[int(t)]] = tgt
+            info["seams"] += 1
+            info["nodes"] += int((ia != ib).sum())
+            info["max_shift_mm"] = max(info["max_shift_mm"], float(d.max()))
+        except Exception as e:  # noqa: BLE001
+            info["failed"].append(dict(face=sm.get("face"), reason=f"{type(e).__name__}: {e}"[:120]))
+    if not info["nodes"]:
+        return info
+    for _ in range(8):                      # lanières accolées : soudures en chaîne
+        nxt = remap[remap]
+        if (nxt == remap).all():
+            break
+        remap = nxt
+    # nœuds épinglés : sommets CAO et nœuds des coutures (ils restent sur leur courbe)
+    pinned = np.zeros(len(qm.X), bool)
+    for _, p_ in gmsh.model.getEntities(0):
+        try:
+            pinned[[lk[int(t)] for t in gmsh.model.mesh.getNodes(0, p_)[0] if int(t) in lk]] = True
+        except Exception:  # noqa: BLE001
+            pass
+    pinned[remap[np.nonzero(remap != np.arange(len(remap)))[0]]] = True
+    X = qm.X.copy()
+    r = _collapse_chords(remap[qm.quads], remap[qm.tris], X, pinned)
+    if r is None:
+        info.update(seams=0, nodes=0)
+        info["failed"].append(dict(face=None, reason="colonne d'éléments impossible à refermer"))
+        return info
+    Q, R, okq, okr, info["chord_merges"] = r
+    qm.X = X
+    Q, R = Q[okq], R[okr]
+    used = np.unique(np.concatenate([Q.ravel(), R.ravel()]))
+    loc = np.full(len(qm.X), -1, np.int64)
+    loc[used] = np.arange(len(used))
+    qm.quads, qm.tris = loc[Q], loc[R]
+    qm.quad_face, qm.tri_face = qm.quad_face[okq], qm.tri_face[okr]
+    qm.X, qm.node_tags = qm.X[used], qm.node_tags[used]
+    if qm.fixed is not None:
+        qm.fixed = qm.fixed[used]
+    return info
 
 
 def nodes_on_curves(qm: QuadMesh, curves) -> np.ndarray:

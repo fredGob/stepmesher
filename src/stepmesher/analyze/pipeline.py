@@ -18,7 +18,7 @@ import numpy as np
 from ..occ.loader import aabb_diag, geom_state, import_step
 from ..occ.topology import SurfTri, build_analysis_mesh, obb
 from . import classify as C
-from .features import detect_bends, detect_holes, free_edge_length
+from .features import detect_bends, detect_holes, detect_sliver_seams, free_edge_length
 from ..occ.holes import fill_holes
 from .fingerprint import exact_hash, exact_invariants, feature_vector
 from .skins import SkinAnalysis, analyze_skins
@@ -65,6 +65,10 @@ class PartAnalysis:
     skin_curve_map: dict = field(default_factory=dict)     # courbe de brep -> courbe du modèle de peau
     skin_face_groups: dict = field(default_factory=dict)   # face de brep représentante -> faces fusionnées (tranches)
     skin_info: dict = field(default_factory=dict)
+    # faces-lanières retirées de la peau (features.detect_sliver_seams) et coutures à faire au
+    # maillage : dict(face, faces, a=[courbes], b=[courbes], width, length), numéros de brep
+    seams: list = field(default_factory=list)
+    sliver_faces: list = field(default_factory=list)
 
     def to_json(self) -> dict:
         d = asdict(self)
@@ -323,6 +327,26 @@ def prepare_part(step_path: str | Path, workdir: str | Path, cfg, reference_skin
     bends, sharp = detect_bends(st, sk, ref, cfg)
     refine_bends_cad(bends, st)
 
+    # faces-lanières (0,1 mm de large) de la peau de référence : retirées de la peau, leurs deux
+    # grands bords seront cousus au maillage (upper part_002 / 004)
+    seams, slivers = [], []
+    try:
+        seams, slivers = detect_sliver_seams(face_curves, ref_faces,
+                                             float(cfg["mesh"].get("sliver_seam_max_width_mm", 0.0)))
+    except Exception as e:  # noqa: BLE001
+        msgs.append(f"faces-lanières : détection en échec ({type(e).__name__}: {e})"[:200])
+    flank_faces = sorted(sk.flank_faces)
+    if slivers:
+        gone = set(slivers)
+        ref_faces = [f for f in ref_faces if f not in gone]
+        flank_faces = [f for f in flank_faces if f not in gone]
+        for b in bends:
+            b["faces"] = [f for f in b["faces"] if f not in gone]
+        bends = [b for b in bends if b["faces"]]
+        msgs.append(f"{len(slivers)} face(s)-lanière(s) de moins de "
+                    f"{float(cfg['mesh']['sliver_seam_max_width_mm']):g} mm de large retirée(s) de la peau : "
+                    f"{len(seams)} couture(s) au maillage")
+
     tri_file = workdir / "analysis_tri.npz"
     np.savez_compressed(tri_file, P=st.P, T=st.T, face=st.face, normal=st.normal, size=st.size,
                         area=st.area, centroid=st.centroid)
@@ -331,15 +355,15 @@ def prepare_part(step_path: str | Path, workdir: str | Path, cfg, reference_skin
     min_hole_d = min((h["diameter"] for h in holes_kept), default=float("inf"))
     fv = feature_vector(kind, cls, diag, dims, len(bends), len(holes_kept), min_bend_r, min_hole_d, len(zones))
     t_ref = cls.get("t_median") or t_med
-    skin = _virtual_skin(brep, workdir, cfg, ref_faces, sorted(sk.flank_faces), face_curves, diag, msgs,
+    skin = _virtual_skin(brep, workdir, cfg, ref_faces, flank_faces, face_curves, diag, msgs,
                          cfg.target_size(diag, t_ref if t_ref and t_ref > 0 else 1.0))
     timings["total"] = time.time() - T0
-    return PartAnalysis(**skin,
+    return PartAnalysis(**skin, seams=seams, sliver_faces=slivers,
         source=str(step_path), brep=str(brep), tri_file=str(tri_file), import_info=dict(
             healing=ir.healing, raw=ir.raw.as_dict(), final=ir.final.as_dict()),
         invariants=inv, exact_hash=ehash, features=fv, diag=diag, obb_dims=[float(x) for x in dims],
         obb_axes=axes.tolist(), kind=kind, classification=cls, reference_side=ref, reference_reason=why,
-        ref_faces=ref_faces, opp_faces=opp_faces, flank_faces=sorted(sk.flank_faces),
+        ref_faces=ref_faces, opp_faces=opp_faces, flank_faces=flank_faces,
         failed_faces=st.failed_faces, face_thickness={int(k): float(v) for k, v in sk.face_thickness.items()},
         face_cad_sign=signs, face_curves=face_curves,
         face_adjacency=[[int(a_), int(b_), float(v["angle_deg"])] for (a_, b_), v in st.adjacency.items()],

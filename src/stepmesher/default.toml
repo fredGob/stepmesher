@@ -114,6 +114,12 @@ virtual_slices = true           # (topologie virtuelle) tranches étroites tange
                                 # 000/009) -> 2 colonnes d'éléments dans la rampe au lieu de 6
 virtual_slices_max_frac = 0.4   # tranche : face à 4 arêtes dont 2 côtés opposés < frac x taille nominale
 virtual_slices_max_dev_mm = 0.05  # écart max (dans les deux sens) face fusionnée / tranches d'origine
+sliver_seam_max_width_mm = 0.3  # face-lanière de la peau plus étroite que ce seuil (largeur moyenne
+                                # 2 x aire / périmètre ; upper part_002 / 004 : 0,1 mm x 7 à 25 mm au droit
+                                # des marches d'épaisseur) : retirée de la peau, ses deux grands bords
+                                # reçoivent le même nombre de nœuds et sont SOUDÉS au maillage (nœuds
+                                # déplacés d'au plus la largeur). Sinon arêtes de 0,05 mm, hexa écrasés,
+                                # ou face d'aire nulle non maillée après nettoyage OCP. 0 = désactivé
 structured_harmonize = true     # plis + lanières + petites faces planifiés ENSEMBLE, côtés par les 4 coins
                                 # réels, nombres de segments harmonisés (patte de upper part_001 bordée
                                 # de plis aux comptes incompatibles -> restait libre, 154 étoiles) ;
