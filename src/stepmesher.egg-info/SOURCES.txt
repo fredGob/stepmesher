@@ -13,6 +13,7 @@ src/stepmesher.egg-info/requires.txt
 src/stepmesher.egg-info/top_level.txt
 src/stepmesher/analyze/__init__.py
 src/stepmesher/analyze/classify.py
+src/stepmesher/analyze/family.py
 src/stepmesher/analyze/feasibility.py
 src/stepmesher/analyze/features.py
 src/stepmesher/analyze/fingerprint.py
@@ -27,7 +28,6 @@ src/stepmesher/llm/advisor.py
 src/stepmesher/llm/client.py
 src/stepmesher/llm/payload.py
 src/stepmesher/llm/schema.py
-src/stepmesher/llm/score.py
 src/stepmesher/mesh/__init__.py
 src/stepmesher/mesh/hexa.py
 src/stepmesher/mesh/offset.py
@@ -51,9 +51,11 @@ src/stepmesher/strategy/runner.py
 src/stepmesher/testdata/__init__.py
 src/stepmesher/testdata/synth.py
 tests/test_analysis.py
+tests/test_compare_runs.py
+tests/test_family.py
 tests/test_feasibility.py
 tests/test_infra.py
 tests/test_llm.py
 tests/test_mesh.py
 tests/test_real.py
-tests/test_score.py
+tests/test_regularity.py

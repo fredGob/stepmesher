@@ -24,7 +24,7 @@ modèle « deux peaux » (pièces massives, nervures, jonctions en T) basculent 
 
 > **État** : les 5 pièces réelles de `stps_test/` sortent avec un maillage valide
 > (voir § 9). Tôle constante : `OK`. Épaisseur variable : `OK_APPROX`. Repli tétra : `OK_TET`.
-> Pas encore faits : mémoire de recettes SQLite, LLM optionnel, zones d'épaisseur alignées
+> Pas encore faits : mémoire de recettes SQLite, zones d'épaisseur alignées
 > sur le maillage (voir § 10).
 
 ---
@@ -64,9 +64,12 @@ stepmesher gen-testdata synth/
 stepmesher dump-config > ma_config.toml
 
 # assembler les .inp valides d'une campagne dans un modele Abaqus maitre avec includes
-python tools/assemble_inp.py result_echelle_llm -o result_echelle_llm/master_include.inp
+python tools/assemble_inp.py result_echelle -o result_echelle/master_include.inp
 # meme assemblage, mais avec tous les blocs *PART ecrits dans un seul fichier
-python tools/assemble_inp.py result_echelle_llm -o result_echelle_llm/master_flat.inp --flatten
+python tools/assemble_inp.py result_echelle -o result_echelle/master_flat.inp --flatten
+
+# non-regression : comparer une nouvelle campagne a la reference (§ 7)
+python tools/compare_runs.py result_v7 result_v8
 ```
 
 Options utiles de `mesh` :
@@ -80,8 +83,6 @@ Options utiles de `mesh` :
 | `--strategies conform,subdiv` | ordre des stratégies de maillage quad |
 | `--tet-order 1\|2` | repli tétra en C3D4 ou C3D10 (défaut 2) |
 | `--no-tet` | pas de repli tétra (échec SC8R = `FAILED_QUALITY`) |
-| `--llm` / `--llm-url URL` | conseiller LLM local (§ 7) |
-| `--decision-observe` | moteur de décision en observation, sans influence sur le maillage |
 | `--threads N` | threads gmsh |
 | `--keep-work` | conserve les essais intermédiaires (`out/.work/`) |
 
@@ -252,40 +253,17 @@ Tétra : `*ELEMENT, TYPE=C3D10` (ou C3D4), `NS_SKIN`, `ES_ALL`, `ES_QUALITY_WARN
 **Aucun bloc matériau** : définir `*MATERIAL, NAME=TBD` (ou renommer) avant calcul.
 Fichiers en ASCII pur (pas d'accents) pour Abaqus.
 
-## 7. Conseiller LLM local (optionnel)
-
-Quand une recette échoue, le prochain essai est choisi soit par les règles déterministes
-(§ 4.3), soit par un **LLM local** servi par llama-server. Désactivé par défaut.
+## 7. Non-régression entre campagnes
 
 ```bash
-llama-server -m qwen3-4b-instruct-q4_k_m.gguf -c 8192 -ngl 99 -fa --port 8080
-stepmesher mesh piece.stp -o out/ --llm            # ou --llm-url http://127.0.0.1:8080
-stepmesher mesh stps_test/ -o out/ -r --llm --decision-observe
+python tools/compare_runs.py result_v7 result_v8 [--tol-el 0.10]
 ```
 
-- **Entrée** : résumé de la pièce (nature, paliers, nombre de faces, plis, trous) et
-  historique des essais (recette, raison de l'échec, faces fautives). Taille bornée par
-  `llm.max_attempts_history` et `llm.max_faces` : mesurée entre 150 et 3 300 tokens sur les
-  pièces d'essai, soit **`-c 8192` largement suffisant**.
-- **Sortie** : un JSON contraint par schéma, une action parmi `alg`, `free`, `merge`,
-  `size`, `subdiv`, `microfix`, `tet`, plus une phrase de justification.
-- **Le LLM ne construit jamais la recette** : il choisit un levier, et le code applique ce
-  levier (`strategy/levers.py`), filtre les faces inventées et borne les valeurs. Une action
-  inconnue, un serveur absent, un délai dépassé ou un JSON illisible font simplement
-  repartir sur les règles déterministes — le maillage n'échoue jamais à cause du LLM.
-- **Traçabilité** : chaque décision (action, recette obtenue, raison, durée, tokens estimés,
-  réponse brute) est écrite dans le `.json` sous la clé `llm`.
-- **Observation du moteur de décision** : `--decision-observe` enregistre dans chaque `.json`
-  les avis `classification` (A/B/C) et `validation` (O/N), sans modifier le pipeline ni le
-  statut final. Les résultats sont sous la clé `decision_observation`.
-
-| Clé `[llm]` | Défaut | Rôle |
-|---|---|---|
-| `enabled` | false | activer le conseiller |
-| `base_url` | http://127.0.0.1:8080 | adresse de llama-server |
-| `timeout_s` / `max_tokens` | 60 / 256 | délai d'une décision, longueur de la réponse |
-| `max_attempts_history` / `max_faces` | 10 / 12 | bornes de la charge utile |
-| `min_attempts_before` | 1 | essais échoués avant de solliciter le LLM |
+Compare les `.json` pièce par pièce (statut, type d'élément, nombre d'éléments, jacobien
+min, % hors cibles). Régression = statut moins bon (`OK`/`OK_APPROX` > `OK_TET` >
+`FAILED_QUALITY` > reste), jacobien min en baisse de plus de 0,02 ou hors cibles en hausse de
+plus de 0,1 point à statut égal. Écart de nombre d'éléments > 10 % signalé. Code retour 1
+si au moins une régression. À lancer après toute modification du mailleur.
 
 ## 8. Configuration
 
@@ -293,7 +271,8 @@ stepmesher mesh stps_test/ -o out/ -r --llm --decision-observe
 
 | Clé | Défaut | Rôle |
 |---|---|---|
-| `mesh.size_frac` | 0,01 | taille cible = fraction de la diagonale OBB… |
+| `mesh.nominal_size_mm` | 10 | taille cible = nominal × min(1, (diag / `nominal_ref_diag_mm`)^`nominal_size_exponent`)… |
+| `mesh.nominal_ref_diag_mm` / `nominal_size_exponent` | 600 / 0,15 | … soit 7,9 mm à 130 mm, 10 mm au-delà de 600 mm (0 = règle `size_frac`)… |
 | `mesh.thickness_factor` | 10 | … plafonnée à k × épaisseur locale… |
 | `mesh.min_size_mm` / `max_size_mm` | 0,5 / 50 | … et bornée |
 | `mesh.n_per_bend` / `n_per_hole` | 4 / 12 | raffinement des plis / trous conservés |
@@ -302,6 +281,7 @@ stepmesher mesh stps_test/ -o out/ -r --llm --decision-observe
 | `holes.max_diameter_mm` / `max_diameter_frac` | 12 / 0,02 | seuil de bouchage = min des deux |
 | `healing.small_edge_tol_mm` | [0.02, 0.01] | tolérances de la passe B |
 | `quality.soft_violation_pct` / `_variable` | 0,2 / 1,0 | % d'éléments tolérés hors cible (constante / variable) |
+| `quality.soft_violation_min_count` | 5 | nombre d'éléments hors cible toujours toléré (petits maillages) |
 | `tet.order` | 2 | 2 = C3D10, 1 = C3D4 |
 | `general.attempt_timeout_s` / `part_time_budget_s` | 600 / 2400 | délais |
 
