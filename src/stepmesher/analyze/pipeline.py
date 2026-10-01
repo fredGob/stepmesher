@@ -59,12 +59,18 @@ class PartAnalysis:
     free_edge_length: float
     timings: dict = field(default_factory=dict)
     messages: list[str] = field(default_factory=list)
+    # topologie virtuelle de la peau (occ/virtual.py) : modèle de maillage à contours simplifiés
+    skin_brep: str = ""
+    skin_face_map: dict = field(default_factory=dict)      # face du modèle de peau -> face de brep
+    skin_curve_map: dict = field(default_factory=dict)     # courbe de brep -> courbe du modèle de peau
+    skin_face_groups: dict = field(default_factory=dict)   # face de brep représentante -> faces fusionnées (tranches)
+    skin_info: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
         d = asdict(self)
-        d["face_thickness"] = {str(k): v for k, v in self.face_thickness.items()}
-        d["face_cad_sign"] = {str(k): v for k, v in self.face_cad_sign.items()}
-        d["face_curves"] = {str(k): v for k, v in self.face_curves.items()}
+        for k in ("face_thickness", "face_cad_sign", "face_curves", "skin_face_map", "skin_curve_map",
+                  "skin_face_groups"):
+            d[k] = {str(a): v for a, v in getattr(self, k).items()}
         return d
 
     @classmethod
@@ -73,6 +79,9 @@ class PartAnalysis:
         d["face_thickness"] = {int(k): v for k, v in d["face_thickness"].items()}
         d["face_cad_sign"] = {int(k): v for k, v in d["face_cad_sign"].items()}
         d["face_curves"] = {int(k): v for k, v in d["face_curves"].items()}
+        for k in ("skin_face_map", "skin_curve_map"):
+            d[k] = {int(a): int(v) for a, v in (d.get(k) or {}).items()}
+        d["skin_face_groups"] = {int(a): [int(t) for t in v] for a, v in (d.get("skin_face_groups") or {}).items()}
         return cls(**d)
 
     def save(self, path: Path):
@@ -178,13 +187,64 @@ def _analyze_current(cfg, diag_hint: float | None = None):
     gs = geom_state()
     diag = diag_hint or aabb_diag()
     t0 = time.time()
-    st = build_analysis_mesh(diag * a["sample_size_frac"], a["sample_curvature"])
+    # taille plafonnée : 1 % de la diagonale = 110 mm sur une coque de 11 m (upper part_011) ->
+    # rayons imprécis sur surface courbe (points ramenés de 1,4 mm sur la CAD, erreur de reprojection)
+    size = diag * a["sample_size_frac"]
+    if a.get("sample_size_max_mm", 0) > 0:
+        size = min(size, float(a["sample_size_max_mm"]))
+    st = build_analysis_mesh(size, a["sample_curvature"])
     t1 = time.time()
     t_est = 2 * gs.volume / max(gs.area, 1e-30)
     t_max = float(min(a["max_thickness_mm"], max(4 * t_est, 1e-3 * diag)))
     sk = analyze_skins(st, cfg, t_max)
     t2 = time.time()
     return st, sk, dict(triangulation=t1 - t0, rays=t2 - t1), t_max
+
+
+def _virtual_skin(brep, workdir, cfg, ref_faces, flank_faces, face_curves, diag, msgs, h0: float = 0.0) -> dict:
+    """Topologie virtuelle de la peau (occ.virtual) : sommets parasites du contour supprimés
+    dans un modèle de maillage à part. Renvoie les champs skin_* de PartAnalysis (vides si
+    désactivé, sans effet ou si une courbe de peau n'a pas de correspondance)."""
+    m = cfg["mesh"]
+    if not m.get("virtual_topology", False) or not ref_faces:
+        return {}
+    t0 = time.time()
+    try:
+        from ..occ.virtual import build_virtual_skin, skin_maps
+        rf = [dict(tag=int(f), centre=list(gmsh.model.occ.getCenterOfMass(2, f)), area=gmsh.model.occ.getMass(2, f))
+              for f in ref_faces]
+        out = Path(workdir) / "skin_virtual.brep"
+        max_slice = float(m.get("virtual_slices_max_frac", 0.4)) * h0 if m.get("virtual_slices", False) else 0.0
+        r = build_virtual_skin(str(brep), rf, str(out), float(m.get("virtual_topology_max_edge_mm", 3.0)),
+                               float(m.get("virtual_topology_max_turn_deg", 15.0)), max_slice,
+                               float(m.get("virtual_slices_max_dev_mm", 0.05)))
+        groups = {int(k): [int(t) for t in v] for k, v in (r.get("groups") or {}).items()}
+        info = dict(status=r["status"], merged={str(k): v for k, v in r["faces"].items()},
+                    slice_groups={str(k): v for k, v in groups.items()}, messages=r["messages"][:10])
+        if r["status"] != "done":
+            return dict(skin_info=info)
+        ref_curves = {c for f in ref_faces for c in face_curves.get(f, [])}
+        # courbes entre deux tranches fusionnées : intérieures à la face virtuelle, sans correspondance
+        inner = {c for g in groups.values() for c in ref_curves
+                 if sum(c in face_curves.get(f, []) for f in g) >= 2}
+        old = {}
+        for c in ref_curves | {c for f in flank_faces for c in face_curves.get(f, [])}:
+            lo, hi = gmsh.model.getParametrizationBounds(1, c)
+            old[c] = np.array(gmsh.model.getValue(1, c, np.linspace(lo[0], hi[0], 7)[1:-1].tolist())).reshape(-1, 3).tolist()
+        maps = skin_maps(str(out), rf, old, tol=0.05 + 1e-5 * diag, groups=groups)
+        missing = sorted(ref_curves - inner - set(maps["curve_map"]))
+        if missing:
+            info.update(status="rejected", reason=f"courbes de peau sans correspondance : {missing[:10]}")
+            return dict(skin_info=info)
+        info["seconds"] = round(time.time() - t0, 2)
+        n = sum(len(v) for v in r["faces"].values())
+        msgs.append(f"topologie virtuelle : {n} courbe(s) fusionnée(s) sur {len(r['faces'])} face(s) de peau"
+                    + (f", {sum(len(g) for g in groups.values())} tranches fusionnées en {len(groups)} face(s)"
+                       if groups else ""))
+        return dict(skin_brep=str(out), skin_face_map=maps["face_map"], skin_curve_map=maps["curve_map"],
+                    skin_face_groups=groups, skin_info=info)
+    except Exception as e:  # noqa: BLE001
+        return dict(skin_info=dict(status="error", reason=f"{type(e).__name__}: {e}"[:300]))
 
 
 def prepare_part(step_path: str | Path, workdir: str | Path, cfg, reference_skin: str | None = None) -> PartAnalysis:
@@ -270,8 +330,11 @@ def prepare_part(step_path: str | Path, workdir: str | Path, cfg, reference_skin
     min_bend_r = min((b["radius"] for b in bends), default=float("inf"))
     min_hole_d = min((h["diameter"] for h in holes_kept), default=float("inf"))
     fv = feature_vector(kind, cls, diag, dims, len(bends), len(holes_kept), min_bend_r, min_hole_d, len(zones))
+    t_ref = cls.get("t_median") or t_med
+    skin = _virtual_skin(brep, workdir, cfg, ref_faces, sorted(sk.flank_faces), face_curves, diag, msgs,
+                         cfg.target_size(diag, t_ref if t_ref and t_ref > 0 else 1.0))
     timings["total"] = time.time() - T0
-    return PartAnalysis(
+    return PartAnalysis(**skin,
         source=str(step_path), brep=str(brep), tri_file=str(tri_file), import_info=dict(
             healing=ir.healing, raw=ir.raw.as_dict(), final=ir.final.as_dict()),
         invariants=inv, exact_hash=ehash, features=fv, diag=diag, obb_dims=[float(x) for x in dims],

@@ -17,6 +17,11 @@ min_bend_deg = 30.0             # plis comptés à partir de cet angle
 occ_target_unit = "MM"          # conversion d'unités à l'import STEP
 attempt_timeout_s = 300         # délai max d'un essai de maillage (sous-processus)
 part_time_budget_s = 900        # budget de temps total par pièce
+budget_ref_elements = 10000     # au-delà de ce nombre d'éléments estimé (demi-aire / h0²), délai par essai
+                                # et budget par pièce augmentés en proportion (0 = jamais) : upper part_011,
+                                # 128 m², ~640 000 SC8R à 10 mm, ne tient pas en 300 s
+attempt_timeout_max_s = 3600    # plafonds de cette mise à l'échelle
+part_time_budget_max_s = 14400
 max_attempts = 8                # nombre max d'essais de maillage par pièce
 threads = 1                     # threads gmsh (> 1 : non déterministe, fausse la non-régression)
 
@@ -32,11 +37,18 @@ max_volume_change = 1e-3        # variation de volume admise pour la suppression
 
 occ_wireframe = true            # nettoyage OCP systématique (ShapeFix_Wireframe) avant maillage :
                                 # effondre les micro-arêtes en préservant le solide (kernel OCP requis)
-occ_wireframe_precision_mm = 0.05      # arêtes plus courtes effondrées (aligné sur quality.min_absolute_edge_mm)
+occ_wireframe_precision_mm = 0.1       # arêtes plus courtes effondrées : 2 x quality.min_absolute_edge_mm, car
+                                       # la parité du full-quad coupe une courbe CAD en 2 segments (0,096 mm ->
+                                       # 2 x 0,048 < 0,05 : critère dur, part_014, upper 001/018)
 occ_wireframe_max_volume_change = 5e-3  # au-delà, le nettoyage OCP est rejeté (géométrie brute conservée)
 occ_chant_fillet_max_arc_mm = 3.0    # micro-congés de CHANT (cylindre de hauteur ~ épaisseur) d'arc plus
                                     # court supprimés (BRepAlgoAPI_Defeaturing) : sinon amas d'éléments
                                     # minuscules au coin du contour (part_025). 0 = désactivé
+occ_chant_facet_max_width_mm = 3.0  # facettes de CHANT (4 arêtes : 2 ~ épaisseur, 2 sur les peaux plus
+                                    # courtes que ce seuil) supprimées de même : leurs 2 sommets rapprochés
+                                    # sur la peau faisaient des rosaces (part_004, 014, 015). 0 = désactivé
+occ_chant_facet_time_s = 60.0       # budget du mode « une par une » (si la suppression groupée casse le solide)
+occ_chant_timeout_s = 90.0          # délai du nettoyage avec chants (sous-processus) ; au-delà : nettoyage sans
 occ_wireframe_precision_mm_deep = 0.6   # 2e passe de nettoyage, plus agressive (sommets isolés proches,
                                 # ex. courtes arêtes entre 2 faces sans arête voisine à fusionner) :
                                 # tentée SEULEMENT si la variante normale n'est pas déjà parfaite, mise
@@ -46,6 +58,7 @@ occ_wireframe_precision_mm_deep = 0.6   # 2e passe de nettoyage, plus agressive 
 
 [analysis]
 sample_size_frac = 0.01         # taille de la triangulation d'analyse (fraction de diagonale)
+sample_size_max_mm = 20.0       # ... plafonnée (grandes pièces : diag 11 m -> 110 mm, trop grossier ; 0 = sans)
 sample_curvature = 12           # éléments par 2*pi pour la triangulation d'analyse
 max_thickness_mm = 15.0         # épaisseur max recherchée lors de l'appariement des peaux
 opposite_normal_tol_deg = 25.0  # tolérance d'antiparallélisme de deux peaux
@@ -85,8 +98,28 @@ max_bend_angle_deg = 30.0       # angle max représenté par un élément dans l
 min_bend_size_frac = 0.35       # taille mini au pli = min_bend_size_frac * h0 (même si le rayon est
                                 # petit) : évite une bande d'éléments minuscules sur toute la longueur
                                 # d'un pli à petit rayon dans une pièce par ailleurs grossière
+contour_arcs = true             # coins arrondis du CONTOUR (vus dans le plan de la tôle) : même règle que
+                                # les plis, 1 él./max_bend_angle_deg, pair -> 4 segments sur 90°
 bend_angle_floor = true         # ce plancher ne descend jamais sous 1 élément par max_bend_angle_deg
                                 # (3 éléments dans un rayon à 90°, règle de Fred)
+virtual_topology = true         # topologie virtuelle de la peau (modèle de MAILLAGE seulement, solide intact) :
+                                # courbes du contour reliées par un sommet parasite fusionnées (BSpline
+                                # exacte) -> plus de nœud imposé par une facette de chant (chanfrein de
+                                # 1,9 mm au bout des pattes de upper part_001, arêtes de 1 mm)
+virtual_topology_max_edge_mm = 3.0   # sommet parasite : une des deux courbes plus courte que ce seuil,
+virtual_topology_max_turn_deg = 15.0 # virage de la tangente sous ce seuil, sommet sur une seule face de peau
+virtual_slices = true           # (topologie virtuelle) tranches étroites tangentes fusionnées en UNE face
+                                # (surface de Coons, arêtes concaténées partagées) : soyage de 0,9 mm sur
+                                # 7 mm découpé en 3 tranches dans le pli et la semelle (upper 022, cadres
+                                # 000/009) -> 2 colonnes d'éléments dans la rampe au lieu de 6
+virtual_slices_max_frac = 0.4   # tranche : face à 4 arêtes dont 2 côtés opposés < frac x taille nominale
+virtual_slices_max_dev_mm = 0.05  # écart max (dans les deux sens) face fusionnée / tranches d'origine
+structured_harmonize = true     # plis + lanières + petites faces planifiés ENSEMBLE, côtés par les 4 coins
+                                # réels, nombres de segments harmonisés (patte de upper part_001 bordée
+                                # de plis aux comptes incompatibles -> restait libre, 154 étoiles) ;
+                                # false = ancien enchaînement face par face
+structured_patch_max_side_frac = 8.0  # (planification harmonisée) faces à 4 coins en transfini jusqu'à
+                                # ce côté max (x h0) ; l'ancien enchaînement s'arrêtait à 3 h0
 structured_patches = false      # true : TOUTES les faces à 4 côtés régulières en transfini
                                 # (false : seulement les petites, côté <= 3 x taille)
 curvature_n = 3                 # éléments par tour complet sur les surfaces courbes (0 = off) ;
@@ -98,13 +131,25 @@ short_curve_dist_frac = 4.0     # portée de ce raffinement (x h0) ; 1,5-2,5 tes
 tangent_angle_deg = 10.0        # fusion en surfaces composites sous cet angle
 reference_skin = "inner"        # inner | outer
 size_variants = [1.0, 0.7, 0.5]      # multiplicateurs de taille essayés pour chaque stratégie
+align_columns = true            # colonnes des faces transfinies redressées (nœuds glissés le long des grands
+                                # côtés, propagation de bande en bande) : patte à bouts en biais (upper 001,
+                                # côtés 7 405 / 7 330 mm) -> colonnes penchées à ~45° sur toute la longueur
 local_repair = true             # bascule d'arête + lissage local des quads médiocres
+boundary_relax = true           # arêtes courtes du CONTOUR (sommet CAD sur un bord lisse, ex. arête de
+                                # 1 mm -> 2 segments de 0,5 mm par parité) : nœuds redistribués le long
+                                # du contour + lissage ; coins réels, plis/faces transfinis et trous fixes
+boundary_relax_short_frac = 0.35  # arête visée : < frac x taille cible
+boundary_relax_corner_deg = 25.0  # virage au-delà duquel un nœud du contour est un coin (fixe)
+boundary_relax_window = 3       # nœuds redistribués de part et d'autre de l'arête courte (au plus)
 repair_threshold = 0.2          # quads visés : jacobien 2D sous ce seuil
 adaptive_attempts = 8           # essais adaptatifs (remaillage local des faces fautives)
 skip_sc8r_below = 0.0           # si > 0 : score de faisabilité SC8R (analyze/feasibility) sous
                                 # ce seuil -> repli tétra direct sans épuiser les essais SC8R.
                                 # 0 = jamais (avis de faisabilité seulement journalisé/summary).
                                 # A calibrer sur une campagne avant d'activer (0.35-0.45 typique).
+large_face_elements = 20000     # face de peau de plus de N éléments (aire / h0²) : algorithme 2D
+large_face_alg = 6              # large_face_alg d'emblée (l'algorithme 8 ne tient pas la taille sur une
+                                # BSpline de 32 m², upper part_011) ; large_face_elements = 0 : off
 strategies = ["conform", "subdiv"]
 t_junction_stop_after = 2       # N essais SC8R maillés TOUS en plusieurs morceaux disjoints : topologie
                                 # des peaux en T (ferrure, profilé en T) -> arrêt des essais SC8R, tétra
@@ -146,6 +191,10 @@ max_thickness_deviation = 0.15  # DUR (tôle constante) : épaisseur d'élément
 allow_wedge_pct = 0.0           # DUR : % de triangles tolérés (convertis en SC6R)
 min_absolute_edge_mm = 0.05     # DUR : plus petite arête tolérée (mm), jamais exemptée, même pour
                                 # une arête « imposée par la CAD » (0 = désactivé)
+crack_tol_mm = 0.05             # DUR : maillage continu. Fissure = nœud de bord à moins de crack_tol_mm
+crack_min_path_mm = 1.0         # d'une autre arête libre, non atteignable en suivant le bord sur moins de
+                                # crack_min_path_mm (faces voisines qui ne partagent pas leurs nœuds :
+                                # echelle part_021, passe B). Arête partagée par 3+ éléments : dur aussi
 min_scaled_jacobian = 0.2       # CIBLE
 max_aspect_ratio = 10.0         # CIBLE : quad dans le plan (arête max / arête min)
 min_angle_deg = 20.0            # CIBLE
@@ -154,6 +203,10 @@ max_warp_deg = 20.0             # CIBLE
 regularity_jump_max = 1.5       # RÉGULARITÉ (non bloquant, départage les recettes qui passent) :
                                 # rapport de tailles max entre quads voisins (règle de Fred)
 regularity_small_frac = 0.5     # ... et quads « trop petits » : < frac x taille nominale (hors plis)
+regularity_topology_weight = 1.0  # ... et « étoiles » (nœuds intérieurs à 3 ou 5+ quads) dans les faces qui
+                                # devraient être maillées en rangées régulières (4 coins : patte, lanière,
+                                # pli) : SIGNALÉ (rapport, log, summary.csv, compare_runs), jamais bloquant ;
+                                # pénalité de départage += poids x % de ces nœuds
 soft_violation_pct = 0.2        # % max d'éléments hors cibles (tôle constante)
 soft_violation_min_count = 5    # ... mais toujours au moins ce nombre d'éléments toléré (petits maillages)
 soft_violation_pct_variable = 1.0  # idem pour les pièces à épaisseur VARIABLE (rampes) : la
