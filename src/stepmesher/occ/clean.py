@@ -26,7 +26,8 @@ class CleanResult:
 def clean_step(src, out_path, precision: float = 0.05, max_tolerance: float | None = None,
                drop_small: bool = True, limit_angle: float = -1.0,
                max_volume_change: float = 5e-3, require_valid: bool = True,
-               fillet_max_arc: float = 0.0) -> CleanResult:
+               fillet_max_arc: float = 0.0, facet_max_width: float = 0.0,
+               facet_time_s: float = 60.0) -> CleanResult:
     """Nettoie `src` (effondrement des aretes < `precision` mm) et ecrit le resultat
     dans `out_path` s'il est accepte. Accepte seulement si le nombre de solides est
     inchange, le volume varie de moins de `max_volume_change` et (si `require_valid`)
@@ -35,7 +36,9 @@ def clean_step(src, out_path, precision: float = 0.05, max_tolerance: float | No
     `fillet_max_arc` > 0 : supprime d'abord les micro-congés de CHANT (face cylindrique
     d'arc <= fillet_max_arc mm dont la hauteur vaut ~l'épaisseur de la tôle) par
     `BRepAlgoAPI_Defeaturing` : les deux chants voisins se prolongent. Leur arc sur la peau
-    imposait deux sommets rapprochés -> amas d'éléments minuscules (part_025)."""
+    imposait deux sommets rapprochés -> amas d'éléments minuscules (part_025).
+    `facet_max_width` > 0 : idem pour les facettes de chant quelconques (4 arêtes : 2 ~ t,
+    2 <= facet_max_width mm), une par une si la suppression groupée casse le solide."""
     src = str(src)
     try:
         from OCP.STEPControl import STEPControl_Reader, STEPControl_Writer, STEPControl_AsIs
@@ -121,10 +124,10 @@ def clean_step(src, out_path, precision: float = 0.05, max_tolerance: float | No
     if n_solids0 == 0:
         return CleanResult("unchanged", src, ["aucun solide : nettoyage OCP ignore (couture gmsh)"])
     messages, fil_stats = [], {}
-    if fillet_max_arc > 0:
+    if fillet_max_arc > 0 or facet_max_width > 0:
         shape1, fil_msg, fil_stats = _defeature_chant_fillets(
             shape, fillet_max_arc, max_volume_change, require_valid, n_solids0, _iter_kind,
-            _count_kind, _volume)
+            _count_kind, _volume, facet_max_width, facet_time_s)
         if fil_msg:
             messages.append(fil_msg)
         shape = shape1
@@ -189,68 +192,167 @@ def _write(shape, out_path, src, messages, stats) -> CleanResult:
 
 
 def _defeature_chant_fillets(shape, max_arc, max_volume_change, require_valid, n_solids0,
-                             iter_kind, count_kind, volume):
-    """Supprime les micro-congés de chant. Renvoie (forme, message, stats) ; forme
-    d'entrée inchangée si rien à faire ou si le résultat est rejeté."""
+                             iter_kind, count_kind, volume, facet_max_width: float = 0.0,
+                             time_budget_s: float = 60.0):
+    """Supprime les micro-congés de chant et les facettes de chant. Renvoie (forme, message,
+    stats) ; forme d'entrée inchangée si rien à faire ou si le résultat est rejeté.
+
+    Candidates (chant = face reliant les deux peaux, hauteur ~ épaisseur t) :
+    - micro-congé : cylindre d'arc <= max_arc, hauteur 0,7-1,5 t ;
+    - facette (si facet_max_width > 0) : face quelconque à 4 arêtes, 2 de longueur ~ t
+      (0,6-1,6 t) et 2 <= facet_max_width (ses arêtes sur les peaux). Ses deux sommets
+      rapprochés sur la peau imposaient deux nœuds -> rosace d'éléments minuscules
+      (part_004, 014, 015). Les chants voisins se prolongent.
+    Toutes d'un coup ; si le résultat est rejeté (solide invalide, fréquent près d'un coin),
+    une par une dans la limite de time_budget_s (4 sur 6 à 8 sur 11 réussissent)."""
+    import time
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Defeaturing
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.BRepCheck import BRepCheck_Analyzer
     from OCP.BRepGProp import BRepGProp
     from OCP.BRepTools import BRepTools
+    from OCP.BRep import BRep_Tool
     from OCP.GeomAbs import GeomAbs_Cylinder
     from OCP.GProp import GProp_GProps
-    from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SOLID
     from OCP.TopoDS import TopoDS
 
     def _s(obj, name):
         return getattr(obj, name + "_s") if hasattr(obj, name + "_s") else getattr(obj, name)
 
-    face_of, uv_bounds = _s(TopoDS, "Face"), _s(BRepTools, "UVBounds")
-    surf_props = _s(BRepGProp, "SurfaceProperties")
+    face_of, edge_of, uv_bounds = _s(TopoDS, "Face"), _s(TopoDS, "Edge"), _s(BRepTools, "UVBounds")
+    surf_props, lin_props = _s(BRepGProp, "SurfaceProperties"), _s(BRepGProp, "LinearProperties")
+    degenerated = _s(BRep_Tool, "Degenerated")
 
     def area(sh):
         g = GProp_GProps()
         surf_props(sh, g)
         return g.Mass()
 
+    def length(e):
+        g = GProp_GProps()
+        lin_props(e, g)
+        return g.Mass()
+
+    def centre(f):
+        g = GProp_GProps()
+        surf_props(f, g)
+        c = g.CentreOfMass()
+        return round(c.X(), 3), round(c.Y(), 3), round(c.Z(), 3)
+
     v0 = volume(shape)
     t_est = 2.0 * v0 / max(area(shape), 1e-30)    # épaisseur d'une tôle ~ 2V/A
-    cands = []
-    for sh in iter_kind(shape, TopAbs_FACE):
-        f = face_of(sh)
-        try:
-            ad = BRepAdaptor_Surface(f)
-            if ad.GetType() != GeomAbs_Cylinder:
+    # une suppression près d'un coin (plusieurs facettes voisines) peut laisser des arêtes de
+    # 0,05-0,3 mm (part_014 : 10 arêtes créées) : pire que la facette -> refusée
+    tiny = 0.25 * t_est
+
+    def n_tiny(sh):
+        return sum(1 for e in iter_kind(sh, TopAbs_EDGE)
+                   if not degenerated(edge_of(e)) and length(edge_of(e)) < tiny)
+
+    def candidates(sh):
+        out = []
+        for fs in iter_kind(sh, TopAbs_FACE):
+            f = face_of(fs)
+            try:
+                ad = BRepAdaptor_Surface(f)
+                if ad.GetType() == GeomAbs_Cylinder:
+                    umin, umax, vmin, vmax = uv_bounds(f)
+                    arc = ad.Cylinder().Radius() * abs(umax - umin)
+                    height = abs(vmax - vmin)
+                    # chant : hauteur (génératrice) ~ épaisseur ; arc court
+                    if arc <= max_arc and 0.7 * t_est <= height <= 1.5 * t_est:
+                        out.append(("congé", f))
+                        continue
+                if facet_max_width <= 0:
+                    continue
+                L = sorted(length(edge_of(e)) for e in iter_kind(f, TopAbs_EDGE)
+                           if not degenerated(edge_of(e)))
+            except Exception:  # noqa: BLE001
                 continue
-            umin, umax, vmin, vmax = uv_bounds(f)
-            arc = ad.Cylinder().Radius() * abs(umax - umin)
-            height = abs(vmax - vmin)
+            if len(L) != 4:
+                continue
+
+            def is_t(x):
+                return 0.6 * t_est <= x <= 1.6 * t_est
+            # arêtes de peau courtes + hauteurs ~ t (dans un sens ou dans l'autre)
+            if (L[1] <= facet_max_width and is_t(L[2]) and is_t(L[3]) and L[1] < 0.9 * L[2]) or \
+                    (is_t(L[0]) and is_t(L[1]) and L[3] <= facet_max_width):
+                out.append(("facette", f))
+        return out
+
+    def defeature(sh, faces):
+        """Forme sans `faces`, ou None si échec / rejet (solides, volume, validité, aucune face retirée).
+
+        Garde-fous locaux : l'écart de volume doit rester de l'ordre de celui des facettes
+        (<= 3 x aire x t ; part_018 upper : 8 facettes de <= 3 mm, dV/V 1,6e-3, chants voisins
+        prolongés de travers -> hexa retournés) ; au plus 3 faces disparues par face demandée
+        (un micro-congé entre deux chants de même surface en retire 3 : légitime, part_037)."""
+        try:
+            d = BRepAlgoAPI_Defeaturing()
+            d.SetShape(sh)
+            for f in faces:
+                d.AddFaceToRemove(f)
+            d.SetRunParallel(False)
+            d.Build()
+            if not d.IsDone():
+                return None
+            out = d.Shape()
         except Exception:  # noqa: BLE001
-            continue
-        # chant : hauteur (génératrice) ~ épaisseur ; arc court
-        if arc <= max_arc and 0.7 * t_est <= height <= 1.5 * t_est:
-            cands.append(f)
-    stats = dict(chant_fillets_found=len(cands), removed=0)
+            return None
+        dv = abs(volume(out) - v0) / max(abs(v0), 1e-30)
+        n_before, n_after = count_kind(sh, TopAbs_FACE), count_kind(out, TopAbs_FACE)
+        dv_local = abs(volume(out) - volume(sh))
+        dv_bound = 3.0 * t_est * sum(area(f) for f in faces) + 1e-9 * abs(v0)
+        if count_kind(out, TopAbs_SOLID) != n_solids0 or dv > max_volume_change or \
+                n_after >= n_before or n_before - n_after > 3 * len(faces) + 1 or dv_local > dv_bound or \
+                n_tiny(out) > n_tiny(sh) or \
+                (require_valid and not BRepCheck_Analyzer(out).IsValid()):
+            return None
+        return out
+
+    cands = candidates(shape)
+    n_fil = sum(1 for k, _ in cands if k == "congé")
+    stats = dict(chant_fillets_found=n_fil, chant_facets_found=len(cands) - n_fil, removed=0)
     if not cands:
         return shape, "", stats
-    try:
-        d = BRepAlgoAPI_Defeaturing()
-        d.SetShape(shape)
-        for f in cands:
-            d.AddFaceToRemove(f)
-        d.SetRunParallel(False)
-        d.Build()
-        if not d.IsDone():
-            return shape, f"micro-congés de chant : defeaturing en échec ({len(cands)})", stats
-        out = d.Shape()
-    except Exception as e:  # noqa: BLE001
-        return shape, f"micro-congés de chant : {type(e).__name__}", stats
+    T0 = time.time()
+    n_faces0 = count_kind(shape, TopAbs_FACE)
+    out = defeature(shape, [f for _, f in cands])
+    mode = "toutes"
+    if out is None:
+        # une par une (re-détection après chaque succès : les faces sont reconstruites)
+        mode, cur, tried = "une par une", shape, set()
+        while time.time() - T0 < time_budget_s:
+            progress = False
+            for _, f in candidates(cur):
+                key = centre(f)
+                if key in tried:
+                    continue
+                tried.add(key)
+                o = defeature(cur, [f])
+                if o is not None:
+                    cur, progress = o, True
+                    break
+                if time.time() - T0 >= time_budget_s:
+                    break
+            if not progress:
+                break
+        out = cur if count_kind(cur, TopAbs_FACE) < n_faces0 else None
+    if out is None:
+        return shape, f"chants : suppression en échec ({n_fil} congés, {len(cands) - n_fil} facettes)", stats
     dv = abs(volume(out) - v0) / max(abs(v0), 1e-30)
-    if count_kind(out, TopAbs_SOLID) != n_solids0 or dv > max_volume_change or \
-            (require_valid and not BRepCheck_Analyzer(out).IsValid()):
-        return shape, f"micro-congés de chant : résultat rejeté (dV/V = {dv:.1e})", stats
-    removed = count_kind(shape, TopAbs_FACE) - count_kind(out, TopAbs_FACE)
-    stats.update(removed=removed, fillet_dv_rel=dv)
-    if removed <= 0:
-        return shape, "", stats
-    return out, f"micro-congés de chant supprimés : {removed} (arc <= {max_arc} mm, dV/V = {dv:.1e})", stats
+    removed = n_faces0 - count_kind(out, TopAbs_FACE)
+    stats.update(removed=removed, fillet_dv_rel=dv, chant_mode=mode, chant_time_s=round(time.time() - T0, 1))
+    return out, (f"micro-congés/facettes de chant supprimés : {removed} faces sur {len(cands)} candidates "
+                 f"({n_fil} congés arc <= {max_arc} mm, {len(cands) - n_fil} facettes <= {facet_max_width} mm ; "
+                 f"{mode}, {time.time() - T0:.1f} s, dV/V = {dv:.1e})"), stats
+
+
+def clean_step_job(src: str, out_path: str, out_json: str, **kw) -> None:
+    """clean_step en sous-processus (strategy.runner.run_isolated) : un seul appel
+    BRepAlgoAPI_Defeaturing peut durer plusieurs minutes (part_018 upper : 334 s)."""
+    import json
+    r = clean_step(src, out_path, **kw)
+    Path(out_json).write_text(json.dumps(dict(status=r.status, path=r.path, messages=r.messages,
+                                              stats=r.stats), default=str))

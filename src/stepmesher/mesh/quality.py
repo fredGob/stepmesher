@@ -100,6 +100,78 @@ def mesh_pieces(n_nodes: int, *conns) -> int:
     return int(len(np.unique(lab[used])))
 
 
+def mesh_cracks(X: np.ndarray, quads, tris=None, tol: float = 0.05, min_path: float = 1.0,
+                top: int = 10) -> dict:
+    """Discontinuités d'un maillage surfacique (peau de référence) : fissures et arêtes
+    non manifold. Critère DUR, indépendant de la CAD.
+
+    Fissure = nœud de bord (arête libre) situé à moins de `tol` d'une autre arête libre qu'on
+    ne peut pas atteindre en suivant le bord sur moins de `min_path` mm : deux bords libres
+    superposés, là où les faces auraient dû partager leurs nœuds. Cas d'origine : echelle
+    part_021, passe B (micro-arêtes supprimées à l'import gmsh) : deux faces de peau décousues,
+    fente de 16 mm, 19 nœuds doublés à 0,004 mm, un seul morceau (mesh_pieces ne voit rien).
+    Le chemin minimal le long du bord écarte les replis d'arêtes microscopiques (déjà rejetés
+    par le plancher absolu de taille)."""
+    import heapq
+    from scipy.spatial import cKDTree
+    Q = np.asarray(quads, dtype=np.int64).reshape(-1, 4)
+    T = np.asarray(tris if tris is not None else np.zeros((0, 3)), dtype=np.int64).reshape(-1, 3)
+    E = np.concatenate([np.stack([F, np.roll(F, -1, 1)], 2).reshape(-1, 2) for F in (Q, T) if len(F)]
+                       or [np.zeros((0, 2), np.int64)])
+    out = dict(n_nodes=0, n_nonmanifold_edges=0, positions=[])
+    if len(E) == 0:
+        return out
+    E = np.sort(E, 1)
+    uniq, cnt = np.unique(E, axis=0, return_counts=True)
+    out["n_nonmanifold_edges"] = int((cnt > 2).sum())
+    B = uniq[cnt == 1]
+    if len(B) == 0:
+        return out
+    Lb = np.linalg.norm(X[B[:, 1]] - X[B[:, 0]], axis=1)
+    adj: dict[int, list] = {}
+    for (a, b), L in zip(B.tolist(), Lb.tolist()):
+        adj.setdefault(a, []).append((b, L))
+        adj.setdefault(b, []).append((a, L))
+    bn = np.array(sorted(adj))
+    tree = cKDTree(X[bn])
+    A, Bp = X[B[:, 0]], X[B[:, 1]]
+    mid = 0.5 * (A + Bp)
+
+    def near_along(n, a, b):
+        """a ou b atteint depuis n en suivant le bord sur moins de min_path mm."""
+        dist, heap = {n: 0.0}, [(0.0, n)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u in (a, b):
+                return True
+            if d > dist.get(u, np.inf):
+                continue
+            for v, L in adj[u]:
+                nd = d + L
+                if nd < min_path and nd < dist.get(v, np.inf):
+                    dist[v] = nd
+                    heapq.heappush(heap, (nd, v))
+        return False
+
+    crack = set()
+    for j in range(len(B)):
+        a, b = int(B[j, 0]), int(B[j, 1])
+        ab = Bp[j] - A[j]
+        den = max(float(ab @ ab), 1e-300)
+        for k in tree.query_ball_point(mid[j], 0.5 * Lb[j] + tol):
+            n = int(bn[k])
+            if n in (a, b) or n in crack:
+                continue
+            s = min(max(float((X[n] - A[j]) @ ab) / den, 0.0), 1.0)
+            if np.linalg.norm(A[j] + s * ab - X[n]) < tol and not near_along(n, a, b):
+                crack.add(n)
+    out["n_nodes"] = len(crack)
+    if crack:
+        P = X[sorted(crack)]
+        out["positions"] = np.round(P[:top], 2).tolist()
+    return out
+
+
 def _stats(x):
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
@@ -162,6 +234,17 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
     m["n_pieces"] = mesh_pieces(len(X), sm.hexa, sm.wedge)
     if m["n_pieces"] > 1:
         reasons.append(f"maillage en {m['n_pieces']} morceaux disjoints (critère dur)")
+    # continuité : faces voisines qui ne partagent pas leurs nœuds (fissure, bords superposés)
+    m["cracks"] = mesh_cracks(X, Qb, sm.wedge[:, :3] if len(sm.wedge) else None,
+                              float(q.get("crack_tol_mm", 0.05)), float(q.get("crack_min_path_mm", 1.0)))
+    n_crack = m["cracks"]["n_nodes"] + m["cracks"]["n_nonmanifold_edges"]
+    if m["cracks"]["n_nodes"]:
+        reasons.append(f"maillage DISCONTINU : {m['cracks']['n_nodes']} nœud(s) sur une fissure (bords libres "
+                       f"superposés à < {q.get('crack_tol_mm', 0.05)} mm, faces non raccordées ; critère dur), "
+                       f"vers {m['cracks']['positions'][0]}")
+    if m["cracks"]["n_nonmanifold_edges"]:
+        reasons.append(f"{m['cracks']['n_nonmanifold_edges']} arête(s) partagée(s) par plus de 2 éléments "
+                       f"(maillage superposé, critère dur)")
     # plancher absolu de taille : jamais exempté, même pour une arête « imposée par la CAD »
     # (sinon un défaut STEP non nettoyé produit des éléments dégénérés qui passent quand même)
     min_edge_mm = q.get("min_absolute_edge_mm", 0.0)
@@ -212,7 +295,8 @@ def evaluate(sm: SolidShellMesh, off: OffsetResult, cfg, kind: str):
     # score pour départager des essais tous en échec (le moins mauvais)
     # score (plus grand = meilleur) : pondère les défauts par gravité
     m["n_hard_bad"] = int(hard_bad.sum())
-    m["score"] = float(-(1000 * m["n_negative_jacobian"] + 1000 * max(0, m.get("n_pieces", 1) - 1) + 20 * m["n_hard_bad"] + 100 * tri_pct + 10 * pct)
+    m["score"] = float(-(1000 * m["n_negative_jacobian"] + 1000 * max(0, m.get("n_pieces", 1) - 1)
+                         + (1000 + 10 * n_crack if n_crack else 0) + 20 * m["n_hard_bad"] + 100 * tri_pct + 10 * pct)
                        + (sj.min() if len(sj) else -1))
     return m, soft_all
 
@@ -249,3 +333,42 @@ def regularity(sm: SolidShellMesh, h0: float, exempt_faces=frozenset(), jump_max
     return dict(small_pct=small_pct, jump_pct=jump_pct,
                 jump_p95=float(np.percentile(ratio, 95)) if len(ratio) else 1.0,
                 penalty=small_pct + jump_pct, n_counted=int(keep.sum()))
+
+
+def topology(quads: np.ndarray, quad_face: np.ndarray, interior: np.ndarray, X: np.ndarray,
+             expected: dict, min_irregular: int = 2, top: int = 20) -> dict:
+    """Régularité TOPOLOGIQUE du maillage de peau (signalement, non bloquant).
+
+    Nœud irrégulier = nœud intérieur à une face CAD (pas sur une courbe) touché par 3, 5 ou
+    plus de quads au lieu de 4 : les « étoiles » d'un maillage libre. Inévitables sur une
+    face de forme libre, elles sont un DÉFAUT sur une face qui devrait être maillée en
+    rangées régulières (`expected` : 4 coins, côtés opposés voisins -> patte, lanière, pli,
+    rectangle ; quad.regular_expected_faces). Cas d'origine : upper part_001, pattes de
+    7,4 m x 36 mm maillées en libre, 154 étoiles, invisibles des critères par élément.
+
+    Renvoie : irregular_pct (tous nœuds intérieurs), faces fautives (>= min_irregular nœuds
+    irréguliers dans une face attendue régulière) avec position, n_faces, n_irregular (dans
+    ces faces) et pct (en % des nœuds intérieurs, sert au départage des recettes)."""
+    Q = np.asarray(quads, dtype=np.int64).reshape(-1, 4)
+    N = len(X)
+    if len(Q) == 0:
+        return dict(irregular_pct=0.0, n_faces=0, n_irregular=0, pct=0.0, faces=[])
+    val = np.bincount(Q.ravel(), minlength=N)
+    face_of = np.full(N, -1, np.int64)
+    face_of[Q.ravel()] = np.repeat(np.asarray(quad_face, np.int64), 4)
+    inner = np.asarray(interior, bool) & (val > 0)
+    irr = inner & (val != 4)
+    n_in = int(inner.sum())
+    faces = []
+    for f, info in expected.items():
+        m = irr & (face_of == int(f))
+        k = int(m.sum())
+        if k >= min_irregular:
+            n_f = int((inner & (face_of == int(f))).sum())
+            faces.append(dict(face=int(f), n_irregular=k, n_interior=n_f,
+                              valence_3=int((m & (val == 3)).sum()), valence_5plus=int((m & (val >= 5)).sum()),
+                              centre=np.round(X[m].mean(0), 1).tolist(), sides_mm=info.get("sides")))
+    faces.sort(key=lambda d: -d["n_irregular"])
+    n_bad = int(sum(d["n_irregular"] for d in faces))
+    return dict(irregular_pct=100.0 * float(irr.sum()) / max(n_in, 1), n_faces=len(faces), n_irregular=n_bad,
+                pct=100.0 * n_bad / max(n_in, 1), n_expected_faces=len(expected), faces=faces[:top])

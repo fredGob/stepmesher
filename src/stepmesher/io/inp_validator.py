@@ -11,9 +11,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ..mesh.quality import HEX_CORNERS, WEDGE_CORNERS, hex_internal_jacobian, scaled_jacobian
+from ..mesh.quality import HEX_CORNERS, WEDGE_CORNERS, hex_internal_jacobian, mesh_cracks, scaled_jacobian
 
 NNODES = {"SC8R": 8, "SC6R": 6, "C3D8": 8, "C3D6": 6, "C3D4": 4, "C3D10": 10}
+# deux nœuds distincts plus proches que ce seuil sans élément commun = maillage non raccordé
+COINCIDENT_TOL_MM = 0.005
 
 
 def _params(line: str):
@@ -201,6 +203,35 @@ def validate_inp(path: Path) -> dict:
                 bad |= det <= 0
             if bad.any():
                 errors.append(f"{int(bad.sum())} élément(s) {et} de volume négatif ou nul")
+    # --- continuité : nœuds confondus non fusionnés, fissures de la peau de référence SC8R ---
+    if len(X):
+        from scipy.spatial import cKDTree
+        close = cKDTree(X).query_pairs(COINCIDENT_TOL_MM)
+        dup = []
+        if close:
+            involved = {i for p in close for i in p}
+            node_el = defaultdict(set)
+            for eid, (_, cn) in elems.items():
+                for c in cn:
+                    if pos.get(c, -1) in involved:
+                        node_el[pos[c]].add(eid)
+            dup = sorted(p for p in close if not node_el[p[0]] & node_el[p[1]])
+        stats["coincident_nodes"] = len(dup)
+        if dup:
+            errors.append(f"{len(dup)} paire(s) de nœuds confondus (< {COINCIDENT_TOL_MM} mm) non reliés : "
+                          f"maillage discontinu, ex. nœuds {ids_sorted[dup[0][0]]} et {ids_sorted[dup[0][1]]}")
+    base = {et: np.array([[pos[c] for c in cn[:k]] for (t, cn) in elems.values() if t == et
+                          and all(c in pos for c in cn)], dtype=np.int64).reshape(-1, k)
+            for et, k in (("SC8R", 4), ("SC6R", 3))}
+    if len(base["SC8R"]) or len(base["SC6R"]):
+        cr = mesh_cracks(X, base["SC8R"], base["SC6R"])
+        stats["crack_nodes"] = cr["n_nodes"]
+        stats["nonmanifold_edges"] = cr["n_nonmanifold_edges"]
+        if cr["n_nodes"]:
+            errors.append(f"peau de référence discontinue : {cr['n_nodes']} nœud(s) sur une fissure "
+                          f"(bords libres superposés), vers {cr['positions'][0]}")
+        if cr["n_nonmanifold_edges"]:
+            errors.append(f"{cr['n_nonmanifold_edges']} arête(s) de peau partagée(s) par plus de 2 éléments")
     for et in ("C3D10", "C3D4"):
         conn = np.array([[pos[c] for c in cn[:4]] for (t, cn) in elems.values() if t == et
                          and all(c in pos for c in cn)], dtype=np.int64).reshape(-1, 4)

@@ -25,7 +25,8 @@ log = logging.getLogger("stepmesher")
 
 SUMMARY_FIELDS = ["part", "status", "memory", "kind", "family", "feasibility", "feasibility_score", "t_median_mm",
                   "n_zones", "reference_skin", "recipe", "element_type", "n_elements", "sj_min", "sj_p05",
-                  "soft_violation_pct", "small_pct", "jump_pct", "reprojection_max", "thickness_dev_max", "n_attempts", "time_s",
+                  "soft_violation_pct", "small_pct", "jump_pct", "irregular_faces", "irregular_nodes",
+                  "reprojection_max", "thickness_dev_max", "n_attempts", "time_s",
                   "output", "message"]
 
 
@@ -48,6 +49,7 @@ def _sc8r_passes(step, work, cfg, reference_skin, report, T0, has_microfix, vtag
     pa, r = _prepare(step, work, cfg_a, reference_skin, report, T0, key=f"analysis_{vtag or 'A'}")
     if pa is None:
         return None
+    _scale_budget(cfg, pa, report)
     out = dict(pa=pa, analysis_json=r["analysis"], winner=None, best=None,
                geometry_pass=f"A ({vlabel})", label=vlabel, no_skin=False, tet_direct=None)
     fam = _analysis_summary(pa, cfg)["family"]
@@ -86,11 +88,46 @@ def _sc8r_passes(step, work, cfg, reference_skin, report, T0, has_microfix, vtag
     return out
 
 
-def _variant_is_perfect(v) -> bool:
-    """Variante SC8R gagnante sans aucun élément hors cibles : inutile d'en essayer une autre."""
+def _scale_budget(cfg: Config, pa, report: dict) -> None:
+    """Grandes pièces : délai par essai et budget par pièce proportionnels au nombre
+    d'éléments estimé (demi-aire / h0²), au-delà de `budget_ref_elements`. Une pièce de
+    128 m² (upper part_011, ~640 000 SC8R à 10 mm) ne peut pas être maillée en 300 s."""
+    g = cfg["general"]
+    ref = float(g.get("budget_ref_elements", 0.0))
+    if ref <= 0:
+        return
+    t = pa.classification.get("t_median") or 1.0
+    h0 = cfg.target_size(pa.diag, t)
+    area = float((pa.import_info.get("final") or {}).get("area", 0.0))
+    n_est = 0.5 * area / max(h0 * h0, 1e-9)
+    s = max(1.0, n_est / ref)
+    if s > report.get("budget_scale", 1.0):
+        report["budget_scale"] = round(s, 2)
+        report["n_elements_estimate"] = int(n_est)
+        a, b = _limits(cfg, report)
+        log.info("grande pièce (~%d éléments estimés) : délai par essai %.0f s, budget %.0f s", n_est, a, b)
+
+
+def _limits(cfg: Config, report: dict) -> tuple[float, float]:
+    """(délai par essai, budget par pièce) après mise à l'échelle (_scale_budget)."""
+    g = cfg["general"]
+    s = float(report.get("budget_scale", 1.0))
+    budget = min(g["part_time_budget_s"] * s, max(g.get("part_time_budget_max_s", 0.0), g["part_time_budget_s"]))
+    # part du budget réservée aux variantes de géométrie suivantes (brute, nettoyage profond)
+    budget *= float(report.get("variant_budget_frac", 1.0))
+    return (min(g["attempt_timeout_s"] * s, max(g.get("attempt_timeout_max_s", 0.0), g["attempt_timeout_s"])),
+            budget)
+
+
+def _variant_is_perfect(v, report: dict | None = None) -> bool:
+    """Variante SC8R gagnante sans aucun élément hors cibles : inutile d'en essayer une autre.
+    Très grande pièce (budget x5 et plus : ~15 min par essai, upper part_011) : une variante
+    qui passe suffit."""
     w = v.get("winner")
     if w is None:
         return False
+    if report is not None and float(report.get("budget_scale", 1.0)) >= 5.0:
+        return True
     return int((w[1]["metrics"].get("soft_violations") or {}).get("count", 0)) == 0
 
 
@@ -133,6 +170,9 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
         has_microfix = bool(cfg["healing"].get("small_edge_tol_mm"))
 
         # ---------- SC8R sur la géométrie nettoyée (ou brute si OCP n'a rien changé) ----------
+        # budget partagé entre variantes : la géométrie nettoyée n'épuise pas tout (part_018 upper :
+        # 16 essais en échec sur la nettoyée, plus de temps pour la variante profonde qui passe)
+        report["variant_budget_frac"] = 0.5 if cleaned else 1.0
         v_clean = _sc8r_passes(step_c, work, cfg, reference_skin, report, T0, has_microfix,
                                vtag="", vlabel="nettoyée" if cleaned else "brute")
         if v_clean is None:
@@ -169,8 +209,9 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
         # des éléments ; on garde le meilleur des deux. Seulement si OCP a nettoyé et que la
         # variante nettoyée n'est pas déjà parfaite. ----------
         variants = [v_clean]
-        if cleaned and not _variant_is_perfect(v_clean) and not report.get("t_junction_early_stop"):
+        if cleaned and not _variant_is_perfect(v_clean, report) and not report.get("t_junction_early_stop"):
             log.info("OCP a nettoyé la géométrie -> essai SC8R aussi sur la géométrie brute (pré-OCP), meilleur retenu")
+            report["variant_budget_frac"] = 0.75
             v_raw = _sc8r_passes(raw_step, work / "raw", cfg, reference_skin, report, T0,
                                  has_microfix, vtag="R", vlabel="brute (pré-OCP)")
             if v_raw is not None and not v_raw["no_skin"]:
@@ -178,9 +219,10 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
 
         # ---------- nettoyage plus profond (sommets isolés proches non fusionnables par une
         # simple arête voisine) : en course avec les variantes précédentes, jamais forcé. ----------
+        report["variant_budget_frac"] = 1.0
         deep_prec = float(cfg["healing"].get("occ_wireframe_precision_mm_deep", 0.0))
         if deep_prec > cfg["healing"]["occ_wireframe_precision_mm"] and not report.get("t_junction_early_stop") \
-                and not _variant_is_perfect(max(variants, key=_variant_rank)):
+                and not _variant_is_perfect(max(variants, key=_variant_rank), report):
             step_deep = _clean_step_occ(raw_step, work / "deep", cfg, report,
                                         precision=deep_prec, report_key="occ_clean_deep")
             if str(step_deep) != str(raw_step):
@@ -272,6 +314,13 @@ def process_part(step: Path, out_dir: Path, cfg: Config, reference_skin: str | N
                         "%d éléments à cheval) - jalon 3", res["metrics"].get("n_step_elements", 0))
         log.info("résultat : %s, %d éléments, jacobien min %.3f -> %s", status, res["metrics"]["n_elements"],
                  res["metrics"]["scaled_jacobian"]["min"], inp.name)
+        topo = res["metrics"].get("topology") or {}
+        if topo.get("n_faces"):
+            log.warning("maillage IRRÉGULIER : %d face(s) qui devraient être en rangées régulières (4 coins) "
+                        "contiennent %d nœud(s) à 3 ou 5+ éléments :", topo["n_faces"], topo["n_irregular"])
+            for fd in topo.get("faces", [])[:10]:
+                log.warning("   face %d : %d nœuds irréguliers / %d, côtés %s mm, vers %s", fd["face"],
+                            fd["n_irregular"], fd["n_interior"], fd.get("sides_mm"), fd["centre"])
         return _finish(report, out_dir, T0)
     finally:
         log.removeHandler(fh)
@@ -287,13 +336,28 @@ def _clean_step_occ(step: Path, work: Path, cfg: Config, report: dict,
     h = cfg["healing"]
     if not h.get("occ_wireframe", False):
         return step
-    from .occ.clean import clean_step
+    from .occ.clean import CleanResult, clean_step
     prec = h["occ_wireframe_precision_mm"] if precision is None else precision
     work.mkdir(parents=True, exist_ok=True)
-    res = clean_step(step, work / "cleaned.step",
-                     precision=prec,
-                     max_volume_change=h["occ_wireframe_max_volume_change"],
-                     fillet_max_arc=float(h.get("occ_chant_fillet_max_arc_mm", 0.0)))
+    kw = dict(precision=prec, max_volume_change=h["occ_wireframe_max_volume_change"],
+              fillet_max_arc=float(h.get("occ_chant_fillet_max_arc_mm", 0.0)),
+              facet_max_width=float(h.get("occ_chant_facet_max_width_mm", 0.0)),
+              facet_time_s=float(h.get("occ_chant_facet_time_s", 60.0)))
+    res = None
+    if kw["facet_max_width"] > 0 or kw["fillet_max_arc"] > 0:
+        # suppression des congés / facettes de chant en sous-processus, avec délai : un seul
+        # appel OCC peut durer plusieurs minutes (part_018 upper : 334 s) -> sans eux sinon
+        t_lim = float(h.get("occ_chant_timeout_s", 180.0))
+        r = run_isolated("stepmesher.occ.clean:clean_step_job",
+                         dict(src=str(step), out_path=str(work / "cleaned.step"),
+                              out_json=str(work / "clean.json"), **kw), work / "clean.json", timeout=t_lim)
+        if r.get("exec_status") == "ok" and "path" in r:
+            res = CleanResult(r["status"], r["path"], r.get("messages", []), r.get("stats", {}))
+        else:
+            log.warning("nettoyage OCP : suppression des chants abandonnée (%s) -> sans", "; ".join(r.get("reasons", []))[:80])
+            kw.update(facet_max_width=0.0, fillet_max_arc=0.0)
+    if res is None:
+        res = clean_step(step, work / "cleaned.step", **kw)
     report[report_key] = dict(status=res.status, messages=res.messages, stats=res.stats, precision_mm=prec)
     for m in res.messages:
         log.info("nettoyage OCP (%.2f mm) : %s", prec, m)
@@ -304,7 +368,7 @@ def _prepare(step, work, cfg, reference_skin, report, T0, key):
     """Analyse en sous-processus isolé. Retourne (PartAnalysis, résultat) ou (None, résultat)."""
     work.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    left = cfg["general"]["part_time_budget_s"] - (t0 - T0)
+    left = _limits(cfg, report)[1] - (t0 - T0)
     r = run_isolated("stepmesher.strategy.jobs:prepare_job",
                      dict(step=str(step), workdir=str(work), cfg_data=cfg.to_dict(),
                           reference_skin=reference_skin, out_json=str(work / "prepare.json")),
@@ -375,10 +439,11 @@ def _sc8r_pass(pa, analysis_json, work, cfg, report, T0, tag: str):
             continue
         seen.add(key)
         elapsed = time.time() - T0
-        if elapsed > g["part_time_budget_s"]:
+        t_attempt, t_budget = _limits(cfg, report)
+        if elapsed > t_budget:
             log.warning("budget de temps par pièce épuisé")
             break
-        timeout = min(g["attempt_timeout_s"], g["part_time_budget_s"] - elapsed)
+        timeout = min(t_attempt, t_budget - elapsed)
         prefix = work / f"attempt_{tag}{k:02d}"
         res = run_isolated("stepmesher.strategy.attempt:run_attempt",
                            dict(analysis_json=analysis_json, recipe=rc.to_dict(), cfg_data=cfg.to_dict(),
@@ -459,22 +524,40 @@ def _tet_fallback(report, pa, analysis_json, work, out_dir, cfg, stem, T0, reaso
     """Essais tétraédriques, chacun en sous-processus isolé (gmsh peut planter) :
     sources géométriques x combinaisons d'algorithmes, arrêt au premier qui passe."""
     from .mesh.tet import TET_ALGOS, tet_sources
+    report["variant_budget_frac"] = 1.0          # tout le budget restant pour le tétra
     if t_part and "min_shape_quality_t" in cfg["tet"]:
         cfg = Config(cfg.to_dict())
         cfg.data["tet"]["min_shape_quality"] = float(cfg["tet"]["min_shape_quality_t"])
     t0 = time.time()                    # sert seulement à mesurer la durée de cette phase
     res, best = {}, None
-    n_src = len(tet_sources(pa))
+    # sources supplémentaires issues du STEP d'entrée (avant le nettoyage OCP principal à
+    # 0,1 mm) : nettoyé à 0,05 mm sans chants, puis tel quel
+    extra_steps = []
+    raw_step = str(report.get("source", ""))
+    if raw_step and raw_step != str(pa.source):
+        h = cfg["healing"]
+        if h.get("occ_wireframe", False):
+            try:
+                from .occ.clean import clean_step
+                r05 = clean_step(raw_step, work / "tet_occ005.step", precision=0.05,
+                                 max_volume_change=h["occ_wireframe_max_volume_change"])
+                if r05.status == "cleaned":
+                    extra_steps.append(r05.path)
+            except Exception as e:  # noqa: BLE001
+                log.warning("tétra : nettoyage OCP 0,05 mm en échec (%s)", type(e).__name__)
+        extra_steps.append(raw_step)
+    n_src = len(tet_sources(pa, extra_steps))
 
     def _try(si, ai, mult=1.0):
-        left = cfg["general"]["part_time_budget_s"] - (time.time() - T0)
+        t_attempt, t_budget = _limits(cfg, report)
+        left = t_budget - (time.time() - T0)
         if left < 30:
             return None
         prefix = work / f"tet_{si}{ai}{'' if mult == 1.0 else f'_x{mult:g}'}"
         r = run_isolated("stepmesher.mesh.tet:run_tet_attempt",
                          dict(analysis_json=analysis_json, cfg_data=cfg.to_dict(), out_prefix=str(prefix),
-                              source=si, algo=ai, size_mult=mult),
-                         prefix.with_suffix(".json"), timeout=min(cfg["general"]["attempt_timeout_s"], left))
+                              source=si, algo=ai, size_mult=mult, extra_steps=extra_steps),
+                         prefix.with_suffix(".json"), timeout=min(t_attempt, left))
         r["_src"] = (si, ai)
         m = r.get("metrics", {})
         alg = r.get("algorithms", {})
@@ -575,6 +658,8 @@ def summary_row(rep: dict) -> dict:
                 soft_violation_pct=(m.get("soft_violations") or {}).get("pct"),
                 small_pct=(m.get("regularity") or {}).get("small_pct"),
                 jump_pct=(m.get("regularity") or {}).get("jump_pct"),
+                irregular_faces=(m.get("topology") or {}).get("n_faces"),
+                irregular_nodes=(m.get("topology") or {}).get("n_irregular"),
                 reprojection_max=(m.get("reprojection_error") or {}).get("max"),
                 thickness_dev_max=(m.get("thickness_deviation") or {}).get("max"),
                 n_attempts=len(rep.get("attempts", [])), time_s=round(rep["timings"]["total"], 1),

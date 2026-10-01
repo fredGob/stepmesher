@@ -188,7 +188,26 @@ def offset_nodes(pa, qm: QuadMesh, edge_nodes: np.ndarray | None = None) -> Offs
             if len(idx):
                 t_ray[idx] = ts[valid]
                 face_hit[idx] = skin.st.face[js[valid]]
+            # le second rayon manque la peau opposée (chant incliné au bord, la peau opposée est
+            # décalée latéralement, part_029 : chant touché à 1,34 mm pour t = 2,71) : point le
+            # plus proche de la peau opposée depuis le nœud décalé d'une épaisseur, retenu si
+            # l'épaisseur obtenue est plausible
+            rest = np.nonzero(short)[0][~valid]
+            if len(rest):
+                p_s, f_s, _ = skin.nearest_cad(qm.X[rest] + d[rest] * t_exp[rest][:, None], d[rest])
+                L_s = np.linalg.norm(p_s - qm.X[rest], axis=1)
+                ok_s = np.abs(L_s / np.maximum(t_exp[rest], 1e-12) - 1.0) < 0.15
+                side_fix = (rest[ok_s], p_s[ok_s], f_s[ok_s])
+            else:
+                side_fix = None
+        else:
+            side_fix = None
+    else:
+        side_fix = None
     approx = qm.X + d * np.where(hit, t_ray, 0.0)[:, None]
+    if side_fix is not None and len(side_fix[0]):
+        approx[side_fix[0]] = side_fix[1]
+        face_hit[side_fix[0]] = side_fix[2]
     fb = ~hit
     if fb.any():
         # repli (rayon rasant en bord libre) : point le plus proche depuis un point

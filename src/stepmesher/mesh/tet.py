@@ -244,17 +244,23 @@ def _extract(order: int):
 TET_ALGOS = ((6, 1, 1.0), (1, 1, 1.0), (6, 10, 1.0))
 
 
-def tet_sources(pa) -> list[tuple[str, str, float | None]]:
+def tet_sources(pa, extra_steps=()) -> list[tuple[str, str, float | None]]:
     """Géométrie préparée (trous bouchés, micro-arêtes supprimées), puis STEP d'origine
     avec correction de micro-arêtes plus douce, puis STEP brut : une tolérance trop
-    agressive peut rendre le maillage de surface auto-intersectant."""
-    return [("préparée", pa.brep, None)] + \
+    agressive peut rendre le maillage de surface auto-intersectant.
+    extra_steps : STEP issus de l'entrée AVANT le nettoyage OCP principal (pa.source est le
+    STEP nettoyé à 0,1 mm), essayés juste après la géométrie préparée, sans correction gmsh
+    (part_001 : nettoyé à 0,1 mm -> un tétra à 0,027 < 0,03 ; nettoyé à 0,05 mm -> passe ;
+    correction gmsh sur le STEP d'origine -> « Could not fix wire »)."""
+    extra = [(f"STEP d'origine {k + 1}", str(p), None) for k, p in enumerate(extra_steps)
+             if p and str(p) != str(pa.source)]
+    return [("préparée", pa.brep, None)] + extra + \
            [(f"STEP, micro-arêtes {t} mm", pa.source, t) for t in (0.1, 0.05, 0.02, 0.01, 0.005)] + \
            [("STEP brut", pa.source, None)]
 
 
 def run_tet_attempt(analysis_json: str, cfg_data: dict, out_prefix: str, source: int = 0, algo: int = 0,
-                    size_mult: float = 1.0) -> dict:
+                    size_mult: float = 1.0, extra_steps=()) -> dict:
     """Un essai tétraédrique (une source géométrique, une combinaison d'algorithmes)."""
     t0 = time.time()
     out = Path(out_prefix)
@@ -265,7 +271,7 @@ def run_tet_attempt(analysis_json: str, cfg_data: dict, out_prefix: str, source:
         tc = cfg["tet"]
         order = int(tc["order"])
         h = tet_size(pa, cfg) * size_mult
-        name, src, fix = tet_sources(pa)[source]
+        name, src, fix = tet_sources(pa, extra_steps)[source]
         alg2d, alg3d, hf = TET_ALGOS[algo]
         res["size"] = h * hf
         res["algorithms"] = dict(geometry=name, alg2d=alg2d, alg3d=alg3d, size_factor=hf)
